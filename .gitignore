@@ -1,0 +1,11 @@
+/wbot
+/bin/
+/web/node_modules/
+/web/dist/
+*.db
+*.db-shm
+*.db-wal
+.wbot-data/
+.env
+*.log
+.DS_Store

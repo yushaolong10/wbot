@@ -1,0 +1,16 @@
+services:
+  wbot:
+    build: .
+    ports: ["8080:8080"]
+    environment:
+      WBOT_MODEL_API_KEY: ${WBOT_MODEL_API_KEY}
+      WBOT_MODEL_BASE_URL: ${WBOT_MODEL_BASE_URL:-https://api.deepseek.com}
+      WBOT_ADVISOR_BASE_URL: ${WBOT_ADVISOR_BASE_URL:-}
+      WBOT_ADVISOR_MODEL: ${WBOT_ADVISOR_MODEL:-deepseek-v4-pro}
+      WBOT_AUTH_TOKEN: ${WBOT_AUTH_TOKEN:-change-me}
+      WBOT_PERMISSION_MODE: ${WBOT_PERMISSION_MODE:-approval}
+    volumes:
+      - wbot-data:/var/lib/wbot
+      - ./workspace:/workspace
+volumes:
+  wbot-data:
