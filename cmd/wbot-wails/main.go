@@ -9,6 +9,7 @@ import (
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
+	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 	"github.com/wbot-dev/wbot/internal/agent"
 	"github.com/wbot-dev/wbot/internal/config"
 	"github.com/wbot-dev/wbot/internal/httpapi"
@@ -18,6 +19,16 @@ import (
 	"github.com/wbot-dev/wbot/internal/storage"
 	"github.com/wbot-dev/wbot/internal/tool"
 )
+
+type DesktopBridge struct{ ctx context.Context }
+
+func (b *DesktopBridge) startup(ctx context.Context) {
+	b.ctx = ctx
+	setApplicationIcon()
+}
+func (b *DesktopBridge) SelectWorkspace() (string, error) {
+	return wailsruntime.OpenDirectoryDialog(b.ctx, wailsruntime.OpenDialogOptions{Title: "选择工作区目录"})
+}
 
 func main() {
 	s, e := config.Load()
@@ -45,7 +56,8 @@ func main() {
 		log.Fatal(e)
 	}
 	api := httpapi.New(s, st, svc, mem)
-	e = wails.Run(&options.App{Title: "wbot", Width: 1280, Height: 820, MinWidth: 900, MinHeight: 600, AssetServer: &assetserver.Options{Handler: api.Handler()}})
+	bridge := &DesktopBridge{}
+	e = wails.Run(&options.App{Title: "wbot", Width: 1280, Height: 820, MinWidth: 900, MinHeight: 600, AssetServer: &assetserver.Options{Handler: api.Handler()}, OnStartup: bridge.startup, Bind: []interface{}{bridge}})
 	if e != nil {
 		log.Fatal(e)
 	}

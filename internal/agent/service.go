@@ -48,6 +48,13 @@ func (s *Service) Start(ctx context.Context, sessionID, objective string) (domai
 	if _, e := s.store.Session(ctx, sessionID); e != nil {
 		return domain.Task{}, e
 	}
+	active, e := s.store.HasActiveTask(ctx, sessionID)
+	if e != nil {
+		return domain.Task{}, e
+	}
+	if active {
+		return domain.Task{}, fmt.Errorf("当前会话仍有任务处理中，请等待最终回复")
+	}
 	t, e := s.store.CreateTask(ctx, sessionID, objective)
 	if e != nil {
 		return t, e

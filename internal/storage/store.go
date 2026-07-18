@@ -141,8 +141,18 @@ func now() string                { return time.Now().UTC().Format(time.RFC3339Na
 func id(prefix string) string    { return prefix + "_" + strings.ReplaceAll(uuid.NewString(), "-", "") }
 func NewID(prefix string) string { return id(prefix) }
 func (s *Store) OpenWorkspace(ctx context.Context, name, root, kind string) (domain.Workspace, error) {
+	var existing domain.Workspace
+	var created string
+	e := s.db.QueryRowContext(ctx, "SELECT id,name,root,kind,created_at FROM workspaces WHERE root=? ORDER BY created_at LIMIT 1", root).Scan(&existing.ID, &existing.Name, &existing.Root, &existing.Kind, &created)
+	if e == nil {
+		existing.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		return existing, nil
+	}
+	if e != sql.ErrNoRows {
+		return domain.Workspace{}, e
+	}
 	w := domain.Workspace{ID: id("ws"), Name: name, Root: root, Kind: kind, CreatedAt: time.Now().UTC()}
-	_, e := s.db.ExecContext(ctx, "INSERT INTO workspaces(id,name,type,path,root,kind,created_at) VALUES(?,?,?,?,?,?,?)", w.ID, w.Name, w.Kind, w.Root, w.Root, w.Kind, w.CreatedAt.Format(time.RFC3339Nano))
+	_, e = s.db.ExecContext(ctx, "INSERT INTO workspaces(id,name,type,path,root,kind,created_at) VALUES(?,?,?,?,?,?,?)", w.ID, w.Name, w.Kind, w.Root, w.Root, w.Kind, w.CreatedAt.Format(time.RFC3339Nano))
 	return w, e
 }
 func (s *Store) Workspaces(ctx context.Context) ([]domain.Workspace, error) {
@@ -152,10 +162,15 @@ func (s *Store) Workspaces(ctx context.Context) ([]domain.Workspace, error) {
 	}
 	defer rows.Close()
 	out := make([]domain.Workspace, 0)
+	seen := make(map[string]bool)
 	for rows.Next() {
 		var x domain.Workspace
 		var t string
 		rows.Scan(&x.ID, &x.Name, &x.Root, &x.Kind, &t)
+		if seen[x.Root] {
+			continue
+		}
+		seen[x.Root] = true
 		x.CreatedAt, _ = time.Parse(time.RFC3339Nano, t)
 		out = append(out, x)
 	}
@@ -163,16 +178,56 @@ func (s *Store) Workspaces(ctx context.Context) ([]domain.Workspace, error) {
 }
 func (s *Store) CreateSession(ctx context.Context, wid, title string) (domain.Session, error) {
 	x := domain.Session{ID: id("session"), WorkspaceID: wid, Title: title, CreatedAt: time.Now().UTC()}
+	x.UpdatedAt = x.CreatedAt
 	ts := x.CreatedAt.Format(time.RFC3339Nano)
 	_, e := s.db.ExecContext(ctx, "INSERT INTO sessions(id,workspace_id,title,status,created_at,updated_at) VALUES(?,?,?,?,?,?)", x.ID, x.WorkspaceID, x.Title, "active", ts, ts)
 	return x, e
 }
 func (s *Store) Session(ctx context.Context, sid string) (domain.Session, error) {
 	var x domain.Session
-	var t string
-	e := s.db.QueryRowContext(ctx, "SELECT id,workspace_id,title,created_at FROM sessions WHERE id=?", sid).Scan(&x.ID, &x.WorkspaceID, &x.Title, &t)
-	x.CreatedAt, _ = time.Parse(time.RFC3339Nano, t)
+	var created, updated string
+	e := s.db.QueryRowContext(ctx, "SELECT id,workspace_id,title,created_at,updated_at FROM sessions WHERE id=?", sid).Scan(&x.ID, &x.WorkspaceID, &x.Title, &created, &updated)
+	x.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+	x.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
 	return x, e
+}
+
+func (s *Store) RenameSession(ctx context.Context, sid, title string) (domain.Session, error) {
+	result, e := s.db.ExecContext(ctx, "UPDATE sessions SET title=? WHERE id=?", title, sid)
+	if e != nil {
+		return domain.Session{}, e
+	}
+	changed, e := result.RowsAffected()
+	if e != nil {
+		return domain.Session{}, e
+	}
+	if changed == 0 {
+		return domain.Session{}, sql.ErrNoRows
+	}
+	return s.Session(ctx, sid)
+}
+
+func (s *Store) SessionsByWorkspace(ctx context.Context, wid string) ([]domain.Session, error) {
+	rows, e := s.db.QueryContext(ctx, `SELECT s.id,s.workspace_id,s.title,s.created_at,s.updated_at
+		FROM sessions s JOIN workspaces w ON w.id=s.workspace_id
+		WHERE w.root=(SELECT root FROM workspaces WHERE id=? LIMIT 1)
+		ORDER BY s.updated_at DESC,s.created_at DESC`, wid)
+	if e != nil {
+		return nil, e
+	}
+	defer rows.Close()
+	out := make([]domain.Session, 0)
+	for rows.Next() {
+		var x domain.Session
+		var created, updated string
+		if e = rows.Scan(&x.ID, &x.WorkspaceID, &x.Title, &created, &updated); e != nil {
+			return nil, e
+		}
+		x.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		x.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
+		out = append(out, x)
+	}
+	return out, rows.Err()
 }
 func (s *Store) AddMessage(ctx context.Context, sid, tid, role, content string) (domain.Message, error) {
 	return s.AddStructuredMessage(ctx, domain.Message{SessionID: sid, TaskID: tid, Role: role, Content: content, Importance: .5})
@@ -207,6 +262,9 @@ func (s *Store) AddStructuredMessage(ctx context.Context, m domain.Message) (dom
 		return m, e
 	}
 	_, e = tx.ExecContext(ctx, "INSERT INTO messages(id,session_id,task_id,seq,role,content,content_json,token_count,content_hash,compaction_state,parent_message_id,tool_call_id,tool_name,artifact_ids,importance,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", m.ID, m.SessionID, m.TaskID, m.Seq, m.Role, m.Content, nullableJSON(m.ContentJSON), m.TokenCount, m.ContentHash, m.CompactionState, nullable(m.ParentMessageID), nullable(m.ToolCallID), nullable(m.ToolName), string(artifacts), m.Importance, m.CreatedAt.Format(time.RFC3339Nano))
+	if e == nil {
+		_, e = tx.ExecContext(ctx, "UPDATE sessions SET updated_at=? WHERE id=?", m.CreatedAt.Format(time.RFC3339Nano), m.SessionID)
+	}
 	if e == nil {
 		e = tx.Commit()
 	}
@@ -498,6 +556,12 @@ func (s *Store) CreateTask(ctx context.Context, sid, objective string) (domain.T
 		e = tx.Commit()
 	}
 	return t, e
+}
+
+func (s *Store) HasActiveTask(ctx context.Context, sid string) (bool, error) {
+	var active bool
+	e := s.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM tasks WHERE session_id=? AND status IN ('running','waiting_approval'))", sid).Scan(&active)
+	return active, e
 }
 func (s *Store) Criteria(ctx context.Context, tid string) ([]domain.AcceptanceCriterion, error) {
 	rows, e := s.db.QueryContext(ctx, "SELECT task_id,criterion,passed,reason FROM task_criteria WHERE task_id=? ORDER BY rowid", tid)

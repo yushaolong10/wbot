@@ -76,6 +76,60 @@ func TestLegacyWorkspaceMigration(t *testing.T) {
 	}
 }
 
+func TestWorkspaceReuseAndSessionListing(t *testing.T) {
+	root := t.TempDir()
+	s, e := Open(filepath.Join(root, "sessions.db"), root)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	w, e := s.OpenWorkspace(ctx, "project", root, "local")
+	if e != nil {
+		t.Fatal(e)
+	}
+	again, e := s.OpenWorkspace(ctx, "project again", root, "local")
+	if e != nil || again.ID != w.ID {
+		t.Fatalf("workspace was not reused: %#v %v", again, e)
+	}
+	first, e := s.CreateSession(ctx, w.ID, "first")
+	if e != nil {
+		t.Fatal(e)
+	}
+	renamed, e := s.RenameSession(ctx, first.ID, "renamed")
+	if e != nil || renamed.Title != "renamed" {
+		t.Fatalf("session was not renamed: %#v %v", renamed, e)
+	}
+	if !renamed.CreatedAt.Equal(first.CreatedAt) || !renamed.UpdatedAt.Equal(first.UpdatedAt) {
+		t.Fatalf("rename changed session timestamps: before=%#v after=%#v", first, renamed)
+	}
+	if _, e = s.db.ExecContext(ctx, "INSERT INTO workspaces(id,name,type,path,root,kind,created_at) VALUES('duplicate','duplicate','local',?,?,'local','2026-01-01T00:00:00Z')", root, root); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = s.CreateSession(ctx, "duplicate", "from duplicate"); e != nil {
+		t.Fatal(e)
+	}
+	active, e := s.HasActiveTask(ctx, first.ID)
+	if e != nil || active {
+		t.Fatalf("new session unexpectedly active: %v %v", active, e)
+	}
+	if _, e = s.CreateTask(ctx, first.ID, "running"); e != nil {
+		t.Fatal(e)
+	}
+	active, e = s.HasActiveTask(ctx, first.ID)
+	if e != nil || !active {
+		t.Fatalf("active task was not detected: %v %v", active, e)
+	}
+	workspaces, e := s.Workspaces(ctx)
+	if e != nil || len(workspaces) != 1 {
+		t.Fatalf("workspaces were not collapsed by root: %#v %v", workspaces, e)
+	}
+	sessions, e := s.SessionsByWorkspace(ctx, w.ID)
+	if e != nil || len(sessions) != 2 {
+		t.Fatalf("sessions were not aggregated by workspace root: %#v %v", sessions, e)
+	}
+}
+
 func TestLegacyDatabaseSupportsCompleteWritePath(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "legacy-full.db")

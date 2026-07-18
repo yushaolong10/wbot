@@ -39,7 +39,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/v1/auth/session", s.authSession)
 	s.mux.HandleFunc("/api/v1/workspaces/open", s.openWorkspace)
 	s.mux.HandleFunc("/api/v1/workspaces", s.workspaces)
-	s.mux.HandleFunc("/api/v1/sessions", s.createSession)
+	s.mux.HandleFunc("/api/v1/sessions", s.sessions)
 	s.mux.HandleFunc("/api/v1/sessions/", func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/messages") {
 			s.message(w, r)
@@ -126,7 +126,21 @@ func (s *Server) workspaces(w http.ResponseWriter, r *http.Request) {
 	x, e := s.store.Workspaces(r.Context())
 	respond(w, x, e)
 }
-func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
+func (s *Server) sessions(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		wid := r.URL.Query().Get("workspace_id")
+		if wid == "" {
+			bad(w, fmt.Errorf("workspace_id is required"))
+			return
+		}
+		x, e := s.store.SessionsByWorkspace(r.Context(), wid)
+		respond(w, x, e)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
 	var in struct{ WorkspaceID, Title string }
 	if !decode(w, r, &in) {
 		return
@@ -139,6 +153,28 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) session(w http.ResponseWriter, r *http.Request) {
 	id := segment(r.URL.Path, "sessions")
+	if r.Method == http.MethodPatch {
+		var in struct{ Title string }
+		if !decode(w, r, &in) {
+			return
+		}
+		in.Title = strings.TrimSpace(in.Title)
+		if in.Title == "" {
+			bad(w, fmt.Errorf("title is required"))
+			return
+		}
+		if len([]rune(in.Title)) > 120 {
+			bad(w, fmt.Errorf("title must be at most 120 characters"))
+			return
+		}
+		x, e := s.store.RenameSession(r.Context(), id, in.Title)
+		respond(w, x, e)
+		return
+	}
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
 	x, e := s.store.Session(r.Context(), id)
 	if e != nil {
 		respond(w, nil, e)

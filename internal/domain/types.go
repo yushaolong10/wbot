@@ -11,7 +11,7 @@ type Workspace struct {
 }
 type Session struct {
 	ID, WorkspaceID, Title string
-	CreatedAt              time.Time
+	CreatedAt, UpdatedAt   time.Time
 }
 type Message struct {
 	ID, SessionID, TaskID, Role, Content  string
