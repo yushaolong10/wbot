@@ -207,17 +207,25 @@ func (s *Server) task(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	nodes, _ := s.store.Nodes(r.Context(), x.ID)
+	timing, _ := s.store.TaskTiming(r.Context(), x.ID)
 	criteria, _ := s.store.Criteria(r.Context(), x.ID)
-	write(w, 200, map[string]any{"task": x, "nodes": nodes, "acceptance_criteria": criteria})
+	write(w, 200, map[string]any{"task": x, "nodes": nodes, "timing": timing, "acceptance_criteria": criteria})
 }
 func (s *Server) cancel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
 	t, e := s.store.Task(r.Context(), segment(r.URL.Path, "tasks"))
 	if e == nil {
 		s.agent.Cancel(t.ID)
-		e = s.store.UpdateTask(r.Context(), t.ID, "cancelled", "", "")
-		s.store.Emit(r.Context(), t.SessionID, t.ID, "task.cancelled", map[string]any{})
+		e = s.store.CancelTask(r.Context(), t.ID)
+		if e == nil {
+			s.store.Emit(r.Context(), t.SessionID, t.ID, "task.cancelled", map[string]any{})
+			t, e = s.store.Task(r.Context(), t.ID)
+		}
 	}
-	respond(w, map[string]bool{"cancelled": e == nil}, e)
+	respond(w, t, e)
 }
 func (s *Server) approvals(w http.ResponseWriter, r *http.Request) {
 	x, e := s.store.Approvals(r.Context(), r.URL.Query().Get("status"))

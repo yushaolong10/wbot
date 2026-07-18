@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/wbot-dev/wbot/internal/domain"
 	"github.com/wbot-dev/wbot/internal/inference"
@@ -273,7 +274,10 @@ func (m *Manager) summarizeMessages(ctx context.Context, sid string, msgs []doma
 	modelName := "deterministic"
 	if m.aux != nil {
 		system := `你负责压缩 Agent 历史。只输出 JSON 对象，字段必须是 objectives,user_constraints,verified_facts,decisions,completed_actions,pending_actions,failed_actions,active_tool_calls,artifacts,memory_ids,file_changes,open_questions，所有字段均为字符串数组。不得把失败写成成功；保留约束、未完成事项、路径和引用 ID；不要推测。`
-		if out, e := m.aux.Complete(ctx, system, string(b)); e == nil {
+		auxCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		out, generateErr := m.aux.Complete(auxCtx, system, string(b))
+		cancel()
+		if generateErr == nil {
 			var parsed domain.HistorySummary
 			if decodeSummary(extractJSON(out), &parsed) == nil {
 				summary = parsed
@@ -338,7 +342,10 @@ func (m *Manager) summarizeSegments(ctx context.Context, sid string, src []domai
 	modelName := "deterministic"
 	if m.aux != nil {
 		system := `合并多个历史摘要。只输出与输入相同字段的 JSON 字符串数组。保留所有未完成事项、用户约束、失败、路径及引用，去重已验证事实；不得推测或宣称未验证成功。`
-		if out, e := m.aux.Complete(ctx, system, string(b)); e == nil {
+		auxCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		out, generateErr := m.aux.Complete(auxCtx, system, string(b))
+		cancel()
+		if generateErr == nil {
 			var x domain.HistorySummary
 			if decodeSummary(extractJSON(out), &x) == nil {
 				merged = x

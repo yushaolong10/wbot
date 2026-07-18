@@ -43,6 +43,20 @@ article label {
   filter: none;
 }
 
+.composer .cancel-task {
+  min-width: 76px;
+  background: #9a3d36;
+}
+
+.composer .cancel-task:disabled {
+  font-size: 0;
+}
+
+.composer .cancel-task:disabled::after {
+  content: "正在处理…";
+  font-size: 13px;
+}
+
 .app > .right {
   display: flex;
   min-height: 0;
@@ -113,6 +127,24 @@ article label {
   padding: 18px 0 8px;
   margin: 0;
   background: #f7f8f5;
+}
+
+.task-timing {
+  margin-top: 7px;
+  color: #65736a;
+  font-size: 11px;
+}
+
+.nodes li {
+  margin-bottom: 7px;
+}
+
+.nodes .node-timing {
+  display: block;
+  clear: both;
+  margin-top: 3px;
+  color: #89938c;
+  font-size: 10px;
 }
 
 .message-meta {

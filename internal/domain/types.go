@@ -62,6 +62,12 @@ type Node struct {
 	RiskLevel                              string
 	Attempt, MaxAttempts                   int
 	Result                                 string
+	CreatedAt, UpdatedAt                   time.Time
+	StartedAt                              *time.Time
+	QueueDurationMS, DurationMS            int64
+}
+type TaskTiming struct {
+	ModelCalls, ModelDurationMS int64
 }
 type Approval struct {
 	ID, TaskID, NodeID, ToolName, Arguments, ArgumentsDigest, RiskLevel, Reason, Status string

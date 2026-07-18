@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS workspaces(id TEXT PRIMARY KEY,name TEXT NOT NULL,typ
 CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,workspace_id TEXT NOT NULL,title TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'active',created_at TEXT NOT NULL,updated_at TEXT NOT NULL,FOREIGN KEY(workspace_id) REFERENCES workspaces(id));
 CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,task_id TEXT,seq INTEGER NOT NULL,role TEXT NOT NULL,content TEXT NOT NULL DEFAULT '',content_json TEXT,token_count INTEGER NOT NULL DEFAULT 0,content_hash TEXT NOT NULL,compaction_state TEXT NOT NULL DEFAULT 'raw',parent_message_id TEXT,tool_call_id TEXT,tool_name TEXT,artifact_ids TEXT NOT NULL DEFAULT '[]',importance REAL NOT NULL DEFAULT 0.5,created_at TEXT NOT NULL,UNIQUE(session_id,seq));
 CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,objective TEXT NOT NULL,status TEXT NOT NULL,result TEXT NOT NULL DEFAULT '',error TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,updated_at TEXT NOT NULL,completed_at TEXT);
-CREATE TABLE IF NOT EXISTS task_nodes(id TEXT PRIMARY KEY,task_id TEXT NOT NULL,title TEXT NOT NULL,description TEXT NOT NULL,status TEXT NOT NULL,depends_on TEXT NOT NULL,risk_level TEXT NOT NULL,attempt INTEGER NOT NULL,max_attempts INTEGER NOT NULL,result TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS task_nodes(id TEXT PRIMARY KEY,task_id TEXT NOT NULL,title TEXT NOT NULL,description TEXT NOT NULL,status TEXT NOT NULL,depends_on TEXT NOT NULL,risk_level TEXT NOT NULL,attempt INTEGER NOT NULL,max_attempts INTEGER NOT NULL,result TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,started_at TEXT,updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS task_checkpoints(id INTEGER PRIMARY KEY AUTOINCREMENT,task_id TEXT NOT NULL,state TEXT NOT NULL,created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS task_criteria(task_id TEXT NOT NULL,criterion TEXT NOT NULL,passed INTEGER NOT NULL DEFAULT 0,reason TEXT NOT NULL DEFAULT '',PRIMARY KEY(task_id,criterion));
 CREATE TABLE IF NOT EXISTS message_summaries(id INTEGER PRIMARY KEY AUTOINCREMENT,session_id TEXT NOT NULL,first_message_id TEXT,last_message_id TEXT,summary TEXT NOT NULL,created_at TEXT NOT NULL);
@@ -80,7 +80,7 @@ func (s *Store) migrateLegacy() error {
 		{"sessions", "status", "TEXT NOT NULL DEFAULT 'active'"}, {"sessions", "updated_at", "TEXT NOT NULL DEFAULT ''"},
 		{"messages", "task_id", "TEXT"}, {"messages", "metadata", "TEXT"}, {"messages", "seq", "INTEGER NOT NULL DEFAULT 0"}, {"messages", "content_json", "TEXT"}, {"messages", "token_count", "INTEGER NOT NULL DEFAULT 0"}, {"messages", "content_hash", "TEXT NOT NULL DEFAULT ''"}, {"messages", "compaction_state", "TEXT NOT NULL DEFAULT 'raw'"}, {"messages", "parent_message_id", "TEXT"}, {"messages", "tool_call_id", "TEXT"}, {"messages", "tool_name", "TEXT"}, {"messages", "artifact_ids", "TEXT NOT NULL DEFAULT '[]'"}, {"messages", "importance", "REAL NOT NULL DEFAULT 0.5"},
 		{"tasks", "result", "TEXT NOT NULL DEFAULT ''"}, {"tasks", "error", "TEXT NOT NULL DEFAULT ''"}, {"tasks", "updated_at", "TEXT NOT NULL DEFAULT ''"}, {"tasks", "completed_at", "TEXT"},
-		{"task_nodes", "description", "TEXT NOT NULL DEFAULT ''"}, {"task_nodes", "depends_on", "TEXT NOT NULL DEFAULT '[]'"}, {"task_nodes", "risk_level", "TEXT NOT NULL DEFAULT 'low'"}, {"task_nodes", "attempt", "INTEGER NOT NULL DEFAULT 0"}, {"task_nodes", "max_attempts", "INTEGER NOT NULL DEFAULT 2"}, {"task_nodes", "result", "TEXT NOT NULL DEFAULT ''"}, {"task_nodes", "created_at", "TEXT NOT NULL DEFAULT ''"}, {"task_nodes", "updated_at", "TEXT NOT NULL DEFAULT ''"},
+		{"task_nodes", "description", "TEXT NOT NULL DEFAULT ''"}, {"task_nodes", "depends_on", "TEXT NOT NULL DEFAULT '[]'"}, {"task_nodes", "risk_level", "TEXT NOT NULL DEFAULT 'low'"}, {"task_nodes", "attempt", "INTEGER NOT NULL DEFAULT 0"}, {"task_nodes", "max_attempts", "INTEGER NOT NULL DEFAULT 2"}, {"task_nodes", "result", "TEXT NOT NULL DEFAULT ''"}, {"task_nodes", "created_at", "TEXT NOT NULL DEFAULT ''"}, {"task_nodes", "started_at", "TEXT"}, {"task_nodes", "updated_at", "TEXT NOT NULL DEFAULT ''"},
 		{"approvals", "session_id", "TEXT NOT NULL DEFAULT ''"}, {"approvals", "node_id", "TEXT"}, {"approvals", "tool_call_id", "TEXT NOT NULL DEFAULT ''"}, {"approvals", "arguments_digest", "TEXT NOT NULL DEFAULT ''"}, {"approvals", "risk_level", "TEXT NOT NULL DEFAULT 'L2'"}, {"approvals", "reason", "TEXT NOT NULL DEFAULT ''"}, {"approvals", "decided_at", "TEXT"},
 		{"events", "trace_id", "TEXT NOT NULL DEFAULT ''"}, {"events", "task_id", "TEXT"}, {"events", "node_id", "TEXT NOT NULL DEFAULT ''"},
 		{"artifacts", "task_id", "TEXT"}, {"artifacts", "kind", "TEXT NOT NULL DEFAULT ''"}, {"artifacts", "mime_type", "TEXT NOT NULL DEFAULT 'application/octet-stream'"},
@@ -587,7 +587,7 @@ func (s *Store) CreateNode(ctx context.Context, tid, title string) (domain.Node,
 	n := domain.Node{ID: id("node"), TaskID: tid, Title: title, Description: title, Status: "running", RiskLevel: "low", MaxAttempts: 2}
 	b, _ := json.Marshal(n.DependsOn)
 	ts := now()
-	_, e := s.db.ExecContext(ctx, "INSERT INTO task_nodes(id,task_id,title,description,status,depends_on,risk_level,attempt,max_attempts,result,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", n.ID, n.TaskID, n.Title, n.Description, n.Status, string(b), n.RiskLevel, n.Attempt, n.MaxAttempts, n.Result, ts, ts)
+	_, e := s.db.ExecContext(ctx, "INSERT INTO task_nodes(id,task_id,title,description,status,depends_on,risk_level,attempt,max_attempts,result,created_at,started_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", n.ID, n.TaskID, n.Title, n.Description, n.Status, string(b), n.RiskLevel, n.Attempt, n.MaxAttempts, n.Result, ts, ts, ts)
 	return n, e
 }
 func (s *Store) CreateGraph(ctx context.Context, tid string, nodes []domain.Node) error {
@@ -615,11 +615,13 @@ func (s *Store) CreateGraph(ctx context.Context, tid string, nodes []domain.Node
 	return tx.Commit()
 }
 func (s *Store) UpdateNode(ctx context.Context, nid, status, result string) error {
-	_, e := s.db.ExecContext(ctx, "UPDATE task_nodes SET status=?,result=? WHERE id=?", status, result, nid)
+	stamp := now()
+	_, e := s.db.ExecContext(ctx, "UPDATE task_nodes SET status=?,result=?,started_at=CASE WHEN ?='running' AND (started_at IS NULL OR started_at='') THEN ? ELSE started_at END,updated_at=? WHERE id=?", status, result, status, stamp, stamp, nid)
 	return e
 }
 func (s *Store) TransitionNode(ctx context.Context, nid, from, to, result string) error {
-	r, e := s.db.ExecContext(ctx, "UPDATE task_nodes SET status=?,result=? WHERE id=? AND status=?", to, result, nid, from)
+	stamp := now()
+	r, e := s.db.ExecContext(ctx, "UPDATE task_nodes SET status=?,result=?,started_at=CASE WHEN ?='running' AND (started_at IS NULL OR started_at='') THEN ? ELSE started_at END,updated_at=? WHERE id=? AND status=?", to, result, to, stamp, stamp, nid, from)
 	if e != nil {
 		return e
 	}
@@ -634,7 +636,7 @@ func (s *Store) SaveCheckpoint(ctx context.Context, tid string, state any) error
 	_, e := s.db.ExecContext(ctx, "INSERT INTO task_checkpoints(task_id,state,created_at) VALUES(?,?,?)", tid, string(b), now())
 	return e
 }
-func (s *Store) RecordModelUsage(ctx context.Context, tid, model, role string, usage map[string]any) error {
+func (s *Store) RecordModelUsage(ctx context.Context, tid, model, role string, usage map[string]any, durationMS int64) error {
 	num := func(k string) int64 {
 		if v, ok := usage[k].(float64); ok {
 			return int64(v)
@@ -642,11 +644,16 @@ func (s *Store) RecordModelUsage(ctx context.Context, tid, model, role string, u
 		return 0
 	}
 	prompt, completion, total := num("prompt_tokens"), num("completion_tokens"), num("total_tokens")
-	_, e := s.db.ExecContext(ctx, "INSERT INTO model_usage(task_id,model,role,input_tokens,output_tokens,total_tokens,prompt_tokens,completion_tokens,duration_ms,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)", tid, model, role, prompt, completion, total, prompt, completion, 0, now())
+	_, e := s.db.ExecContext(ctx, "INSERT INTO model_usage(task_id,model,role,input_tokens,output_tokens,total_tokens,prompt_tokens,completion_tokens,duration_ms,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)", tid, model, role, prompt, completion, total, prompt, completion, durationMS, now())
 	return e
 }
+func (s *Store) TaskTiming(ctx context.Context, tid string) (domain.TaskTiming, error) {
+	var out domain.TaskTiming
+	e := s.db.QueryRowContext(ctx, "SELECT COUNT(*),COALESCE(SUM(duration_ms),0) FROM model_usage WHERE task_id=? AND role='executor'", tid).Scan(&out.ModelCalls, &out.ModelDurationMS)
+	return out, e
+}
 func (s *Store) Nodes(ctx context.Context, tid string) ([]domain.Node, error) {
-	rows, e := s.db.QueryContext(ctx, "SELECT id,task_id,title,description,status,depends_on,risk_level,attempt,max_attempts,result FROM task_nodes WHERE task_id=?", tid)
+	rows, e := s.db.QueryContext(ctx, "SELECT id,task_id,title,description,status,depends_on,risk_level,attempt,max_attempts,result,created_at,started_at,updated_at FROM task_nodes WHERE task_id=?", tid)
 	if e != nil {
 		return nil, e
 	}
@@ -654,9 +661,30 @@ func (s *Store) Nodes(ctx context.Context, tid string) ([]domain.Node, error) {
 	out := make([]domain.Node, 0)
 	for rows.Next() {
 		var n domain.Node
-		var d string
-		rows.Scan(&n.ID, &n.TaskID, &n.Title, &n.Description, &n.Status, &d, &n.RiskLevel, &n.Attempt, &n.MaxAttempts, &n.Result)
+		var d, created, updated string
+		var started sql.NullString
+		if e = rows.Scan(&n.ID, &n.TaskID, &n.Title, &n.Description, &n.Status, &d, &n.RiskLevel, &n.Attempt, &n.MaxAttempts, &n.Result, &created, &started, &updated); e != nil {
+			return nil, e
+		}
 		json.Unmarshal([]byte(d), &n.DependsOn)
+		n.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		n.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
+		if started.Valid {
+			if value, parseErr := time.Parse(time.RFC3339Nano, started.String); parseErr == nil {
+				n.StartedAt = &value
+			}
+		}
+		nowTime := time.Now().UTC()
+		if n.StartedAt != nil {
+			n.QueueDurationMS = maxInt64(0, n.StartedAt.Sub(n.CreatedAt).Milliseconds())
+			end := n.UpdatedAt
+			if n.Status == "running" || n.Status == "waiting_approval" || n.Status == "verifying" {
+				end = nowTime
+			}
+			n.DurationMS = maxInt64(0, end.Sub(*n.StartedAt).Milliseconds())
+		} else if !n.CreatedAt.IsZero() {
+			n.QueueDurationMS = maxInt64(0, nowTime.Sub(n.CreatedAt).Milliseconds())
+		}
 		out = append(out, n)
 	}
 	return out, rows.Err()
@@ -675,7 +703,7 @@ func (s *Store) TaskWorkspaceRoot(ctx context.Context, tid string) (string, erro
 	return root, e
 }
 func (s *Store) TasksBySession(ctx context.Context, sid string) ([]domain.Task, error) {
-	rows, e := s.db.QueryContext(ctx, "SELECT id,session_id,objective,status,result,error,created_at,updated_at FROM tasks WHERE session_id=? ORDER BY created_at DESC", sid)
+	rows, e := s.db.QueryContext(ctx, "SELECT id,session_id,objective,status,result,error,created_at,updated_at FROM tasks WHERE session_id=? ORDER BY created_at DESC LIMIT 20", sid)
 	if e != nil {
 		return nil, e
 	}
@@ -694,6 +722,24 @@ func (s *Store) TasksBySession(ctx context.Context, sid string) ([]domain.Task, 
 func (s *Store) UpdateTask(ctx context.Context, tid, status, result, errText string) error {
 	_, e := s.db.ExecContext(ctx, "UPDATE tasks SET status=?,result=?,error=?,updated_at=? WHERE id=?", status, result, errText, now(), tid)
 	return e
+}
+func (s *Store) CancelTask(ctx context.Context, tid string) error {
+	tx, e := s.db.BeginTx(ctx, nil)
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	stamp := now()
+	if _, e = tx.ExecContext(ctx, "UPDATE tasks SET status='cancelled',result='',error='',updated_at=? WHERE id=?", stamp, tid); e != nil {
+		return e
+	}
+	if _, e = tx.ExecContext(ctx, "UPDATE task_nodes SET status='cancelled',updated_at=? WHERE task_id=? AND status IN ('pending','ready','running','waiting_approval','waiting_external','verifying')", stamp, tid); e != nil {
+		return e
+	}
+	if _, e = tx.ExecContext(ctx, "UPDATE approvals SET status='cancelled',decided_at=? WHERE task_id=? AND status='pending'", stamp, tid); e != nil {
+		return e
+	}
+	return tx.Commit()
 }
 func (s *Store) RunningTasks(ctx context.Context) ([]string, error) {
 	rows, e := s.db.QueryContext(ctx, "SELECT id FROM tasks WHERE status IN ('running','waiting_approval')")
@@ -889,6 +935,13 @@ func (s *Store) Metrics(ctx context.Context) (map[string]any, error) {
 		out[k] = n
 	}
 	return out, nil
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 var _ = fmt.Sprintf

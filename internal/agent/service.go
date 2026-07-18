@@ -33,6 +33,13 @@ type Service struct {
 	maintenanceOnce sync.Once
 }
 
+type toolExecution struct {
+	call          domain.ToolCall
+	result        domain.ToolResult
+	approval      *domain.Approval
+	originalBytes int
+}
+
 func New(s config.Settings, st *storage.Store, m model.Generator, t *tool.Registry, mem *memory.Manager, auxiliary ...inference.TextGenerator) *Service {
 	hc := history.Config{Budget: s.MaxContextTokens / 4, MaxLoaded: s.History.MaxLoadedMessages, Recent: s.History.RecentMessages, RecentMin: s.History.RecentMinMessages, ReactiveRecent: s.History.ReactiveRecentMessages, SegmentMessages: s.History.SegmentMessages, SegmentMaxTokens: s.History.SegmentMaxSourceTokens, MergeFactor: s.History.SegmentMergeFactor, SummaryTarget: s.History.SummaryTargetTokens}
 	opts := []history.Option{history.WithConfig(hc)}
@@ -176,6 +183,7 @@ func (s *Service) Run(ctx context.Context, tid string) error {
 		if e != nil {
 			return s.fail(ctx, t, nodeID, e)
 		}
+		modelStarted := time.Now()
 		resp, e := s.model.Generate(ctx, built.Messages, s.tools.Definitions())
 		reactiveRetries := s.s.History.ReactiveRetryCount
 		if reactiveRetries <= 0 {
@@ -196,11 +204,13 @@ func (s *Service) Run(ctx context.Context, tid string) error {
 				}
 			}
 		}
+		modelDurationMS := time.Since(modelStarted).Milliseconds()
+		_ = s.store.RecordModelUsage(ctx, t.ID, s.s.DefaultModel.Name, "executor", resp.Usage, modelDurationMS)
 		if e != nil {
+			s.store.Emit(ctx, t.SessionID, t.ID, "model.failed", map[string]any{"duration_ms": modelDurationMS, "error": e.Error()})
 			return s.fail(ctx, t, nodeID, e)
 		}
-		_ = s.store.RecordModelUsage(ctx, t.ID, s.s.DefaultModel.Name, "executor", resp.Usage)
-		s.store.Emit(ctx, t.SessionID, t.ID, "model.completed", map[string]any{"usage": resp.Usage, "tool_calls": len(resp.ToolCalls)})
+		s.store.Emit(ctx, t.SessionID, t.ID, "model.completed", map[string]any{"usage": resp.Usage, "tool_calls": len(resp.ToolCalls), "duration_ms": modelDurationMS})
 		if len(resp.ToolCalls) == 0 {
 			content := strings.TrimSpace(resp.Content)
 			if content == "" {
@@ -232,39 +242,125 @@ func (s *Service) Run(ctx context.Context, tid string) error {
 		}
 		callsJSON, _ := json.Marshal(resp.ToolCalls)
 		_, _ = s.store.AddStructuredMessage(ctx, domain.Message{SessionID: t.SessionID, TaskID: t.ID, Role: "assistant", Content: resp.Content, ContentJSON: callsJSON, Importance: .7})
-		for callIndex, call := range resp.ToolCalls {
-			s.store.Emit(ctx, t.SessionID, t.ID, "tool.started", call)
-			result, approval := s.tools.Execute(ctx, t.ID, call)
-			rawResult, _ := json.Marshal(result)
-			if len(rawResult) > 8*1024 {
-				if aid, x := s.store.PutArtifact(ctx, t.ID, "application/json", rawResult); x == nil {
-					result.Artifacts = append(result.Artifacts, aid)
+		for callIndex := 0; callIndex < len(resp.ToolCalls); {
+			end := callIndex + 1
+			var executions []toolExecution
+			if resp.ToolCalls[callIndex].Name == "filesystem.read" {
+				firstArguments, _ := json.Marshal(resp.ToolCalls[callIndex].Arguments)
+				seen := map[string]bool{string(firstArguments): true}
+				for end < len(resp.ToolCalls) && resp.ToolCalls[end].Name == "filesystem.read" {
+					arguments, _ := json.Marshal(resp.ToolCalls[end].Arguments)
+					if seen[string(arguments)] {
+						break
+					}
+					seen[string(arguments)] = true
+					end++
+				}
+				executions = s.executeReadBatch(ctx, t, resp.ToolCalls[callIndex:end])
+			} else {
+				call := resp.ToolCalls[callIndex]
+				s.store.Emit(ctx, t.SessionID, t.ID, "tool.started", call)
+				executions = []toolExecution{s.executeTool(ctx, t, call)}
+			}
+			for offset, execution := range executions {
+				currentIndex := callIndex + offset
+				if e = s.persistToolExecution(ctx, t, execution); e != nil {
+					return s.fail(ctx, t, nodeID, e)
+				}
+				if execution.approval != nil {
+					// Chat completion APIs require one result for every call in the
+					// assistant's tool_calls array. Mark unstarted siblings explicitly.
+					for _, skipped := range resp.ToolCalls[currentIndex+1:] {
+						skippedResult := domain.ToolResult{ToolCallID: skipped.ID, Status: "skipped", Summary: "未执行：同批次工具调用正在等待审批", Retryable: true}
+						raw, _ := json.Marshal(skippedResult)
+						if _, x := s.store.AddStructuredMessage(ctx, domain.Message{SessionID: t.SessionID, TaskID: t.ID, Role: "tool", Content: skippedResult.Summary, ContentJSON: raw, ToolCallID: skipped.ID, ToolName: skipped.Name, Importance: .8}); x != nil {
+							return s.fail(ctx, t, nodeID, x)
+						}
+					}
+					_ = s.store.UpdateNode(ctx, nodeID, "waiting_approval", "")
+					s.store.UpdateTask(ctx, t.ID, "waiting_approval", "", "")
+					s.store.Emit(ctx, t.SessionID, t.ID, "approval.requested", execution.approval)
+					return nil
 				}
 			}
-			result = history.ToolSnapshotFor(call.Name, result, s.s.History.ToolSnapshotMaxTokens*3)
-			if len(rawResult) > s.s.History.ToolSnapshotMaxTokens*3 {
-				s.store.Emit(ctx, t.SessionID, t.ID, "tool.snapshot.created", map[string]any{"tool_call_id": call.ID, "tool": call.Name, "original_bytes": len(rawResult), "artifact_ids": result.Artifacts})
-			}
-			rb, _ := json.Marshal(result)
-			_, _ = s.store.AddStructuredMessage(ctx, domain.Message{SessionID: t.SessionID, TaskID: t.ID, Role: "tool", Content: result.Summary, ContentJSON: rb, ToolCallID: call.ID, ToolName: call.Name, ArtifactIDs: result.Artifacts, Importance: .8})
-			if approval != nil {
-				// Chat completion APIs require one result for every call in the
-				// assistant's tool_calls array. Mark unstarted siblings explicitly.
-				for _, skipped := range resp.ToolCalls[callIndex+1:] {
-					skippedResult := domain.ToolResult{ToolCallID: skipped.ID, Status: "skipped", Summary: "未执行：同批次工具调用正在等待审批", Retryable: true}
-					raw, _ := json.Marshal(skippedResult)
-					_, _ = s.store.AddStructuredMessage(ctx, domain.Message{SessionID: t.SessionID, TaskID: t.ID, Role: "tool", Content: skippedResult.Summary, ContentJSON: raw, ToolCallID: skipped.ID, ToolName: skipped.Name, Importance: .8})
-				}
-				_ = s.store.UpdateNode(ctx, nodeID, "waiting_approval", "")
-				s.store.UpdateTask(ctx, t.ID, "waiting_approval", "", "")
-				s.store.Emit(ctx, t.SessionID, t.ID, "approval.requested", approval)
-				return nil
-			}
-			s.store.Emit(ctx, t.SessionID, t.ID, "tool.completed", result)
-			_ = s.store.SaveCheckpoint(ctx, t.ID, map[string]any{"phase": "tool_completed", "tool_call": call.ID})
+			callIndex = end
 		}
 	}
 	return s.fail(ctx, t, nodeID, fmt.Errorf("agent exceeded maximum rounds"))
+}
+
+func (s *Service) executeReadBatch(ctx context.Context, task domain.Task, calls []domain.ToolCall) []toolExecution {
+	for _, call := range calls {
+		s.store.Emit(ctx, task.SessionID, task.ID, "tool.started", call)
+	}
+	limit := s.s.MaxParallelism
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > 4 {
+		limit = 4
+	}
+	return executeToolBatch(ctx, calls, limit, func(callCtx context.Context, call domain.ToolCall) toolExecution {
+		return s.executeTool(callCtx, task, call)
+	})
+}
+
+func executeToolBatch(ctx context.Context, calls []domain.ToolCall, limit int, run func(context.Context, domain.ToolCall) toolExecution) []toolExecution {
+	results := make([]toolExecution, len(calls))
+	if len(calls) == 0 {
+		return results
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	if limit > len(calls) {
+		limit = len(calls)
+	}
+	indexes := make(chan int)
+	var workers sync.WaitGroup
+	workers.Add(limit)
+	for worker := 0; worker < limit; worker++ {
+		go func() {
+			defer workers.Done()
+			for index := range indexes {
+				results[index] = run(ctx, calls[index])
+			}
+		}()
+	}
+	for index := range calls {
+		indexes <- index
+	}
+	close(indexes)
+	workers.Wait()
+	return results
+}
+
+func (s *Service) executeTool(ctx context.Context, task domain.Task, call domain.ToolCall) toolExecution {
+	result, approval := s.tools.Execute(ctx, task.ID, call)
+	rawResult, _ := json.Marshal(result)
+	if len(rawResult) > 8*1024 {
+		if aid, err := s.store.PutArtifact(ctx, task.ID, "application/json", rawResult); err == nil {
+			result.Artifacts = append(result.Artifacts, aid)
+		}
+	}
+	originalBytes := len(rawResult)
+	result = history.ToolSnapshotFor(call.Name, result, s.s.History.ToolSnapshotMaxTokens*3)
+	return toolExecution{call: call, result: result, approval: approval, originalBytes: originalBytes}
+}
+
+func (s *Service) persistToolExecution(ctx context.Context, task domain.Task, execution toolExecution) error {
+	if execution.originalBytes > s.s.History.ToolSnapshotMaxTokens*3 {
+		s.store.Emit(ctx, task.SessionID, task.ID, "tool.snapshot.created", map[string]any{"tool_call_id": execution.call.ID, "tool": execution.call.Name, "original_bytes": execution.originalBytes, "artifact_ids": execution.result.Artifacts})
+	}
+	raw, _ := json.Marshal(execution.result)
+	if _, err := s.store.AddStructuredMessage(ctx, domain.Message{SessionID: task.SessionID, TaskID: task.ID, Role: "tool", Content: execution.result.Summary, ContentJSON: raw, ToolCallID: execution.call.ID, ToolName: execution.call.Name, ArtifactIDs: execution.result.Artifacts, Importance: .8}); err != nil {
+		return err
+	}
+	if execution.approval != nil {
+		return nil
+	}
+	s.store.Emit(ctx, task.SessionID, task.ID, "tool.completed", execution.result)
+	return s.store.SaveCheckpoint(ctx, task.ID, map[string]any{"phase": "tool_completed", "tool_call": execution.call.ID})
 }
 
 func (s *Service) closeInterruptedToolGroup(ctx context.Context, task domain.Task) error {
@@ -317,6 +413,10 @@ func (s *Service) Resume(ctx context.Context, tid string) {
 	s.RunAsync(tid)
 }
 func (s *Service) fail(ctx context.Context, t domain.Task, nid string, e error) error {
+	current, taskErr := s.store.Task(context.Background(), t.ID)
+	if taskErr == nil && current.Status == "cancelled" {
+		return e
+	}
 	s.store.UpdateNode(ctx, nid, "failed", e.Error())
 	s.store.UpdateTask(ctx, t.ID, "failed", "", e.Error())
 	s.store.Emit(ctx, t.SessionID, t.ID, "task.failed", map[string]any{"error": e.Error()})

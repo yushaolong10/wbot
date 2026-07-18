@@ -203,3 +203,47 @@ func TestInterruptedToolGroupGetsUnknownResult(t *testing.T) {
 		t.Fatalf("messages=%+v", msgs)
 	}
 }
+
+func TestExecuteToolBatchIsBoundedAndPreservesOrder(t *testing.T) {
+	calls := make([]domain.ToolCall, 5)
+	for index := range calls {
+		calls[index] = domain.ToolCall{ID: fmt.Sprintf("read-%d", index), Name: "filesystem.read"}
+	}
+	entered := make(chan struct{}, len(calls))
+	release := make(chan struct{})
+	done := make(chan []toolExecution, 1)
+	go func() {
+		done <- executeToolBatch(context.Background(), calls, 3, func(_ context.Context, call domain.ToolCall) toolExecution {
+			entered <- struct{}{}
+			<-release
+			return toolExecution{call: call, result: domain.ToolResult{ToolCallID: call.ID}}
+		})
+	}()
+	for index := 0; index < 3; index++ {
+		select {
+		case <-entered:
+		case <-time.After(time.Second):
+			t.Fatal("batch did not start configured workers")
+		}
+	}
+	select {
+	case <-entered:
+		t.Fatal("batch exceeded concurrency limit")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	var results []toolExecution
+	select {
+	case results = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("batch did not complete")
+	}
+	if len(results) != len(calls) {
+		t.Fatalf("results=%d", len(results))
+	}
+	for index, result := range results {
+		if result.call.ID != calls[index].ID || result.result.ToolCallID != calls[index].ID {
+			t.Fatalf("result %d out of order: %+v", index, result)
+		}
+	}
+}

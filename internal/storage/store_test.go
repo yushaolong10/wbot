@@ -6,6 +6,7 @@ import (
 	_ "modernc.org/sqlite"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestPersistenceAndExactApproval(t *testing.T) {
@@ -113,12 +114,24 @@ func TestWorkspaceReuseAndSessionListing(t *testing.T) {
 	if e != nil || active {
 		t.Fatalf("new session unexpectedly active: %v %v", active, e)
 	}
-	if _, e = s.CreateTask(ctx, first.ID, "running"); e != nil {
+	running, e := s.CreateTask(ctx, first.ID, "running")
+	if e != nil {
+		t.Fatal(e)
+	}
+	if _, e = s.CreateApproval(ctx, running.ID, "", "filesystem.write", map[string]any{"path": "x"}, "L2", "test"); e != nil {
 		t.Fatal(e)
 	}
 	active, e = s.HasActiveTask(ctx, first.ID)
 	if e != nil || !active {
 		t.Fatalf("active task was not detected: %v %v", active, e)
+	}
+	if e = s.CancelTask(ctx, running.ID); e != nil {
+		t.Fatal(e)
+	}
+	active, e = s.HasActiveTask(ctx, first.ID)
+	pending, approvalErr := s.Approvals(ctx, "pending")
+	if e != nil || active || approvalErr != nil || len(pending) != 0 {
+		t.Fatalf("cancel did not clear active state and approvals: active=%v pending=%d errors=%v/%v", active, len(pending), e, approvalErr)
 	}
 	workspaces, e := s.Workspaces(ctx)
 	if e != nil || len(workspaces) != 1 {
@@ -186,8 +199,20 @@ INSERT INTO workspaces(id,name,type,path,created_at) VALUES('old','legacy','loca
 	if _, e = s.CreateApproval(ctx, task.ID, node.ID, "shell.execute", map[string]any{"command": "true"}, "L2", "test"); e != nil {
 		t.Fatalf("approval after migration: %v", e)
 	}
-	if e = s.RecordModelUsage(ctx, task.ID, "test", "assistant", map[string]any{"prompt_tokens": float64(2), "completion_tokens": float64(3), "total_tokens": float64(5)}); e != nil {
+	if e = s.RecordModelUsage(ctx, task.ID, "test", "executor", map[string]any{"prompt_tokens": float64(2), "completion_tokens": float64(3), "total_tokens": float64(5)}, 12); e != nil {
 		t.Fatalf("model usage after migration: %v", e)
+	}
+	timing, e := s.TaskTiming(ctx, task.ID)
+	if e != nil || timing.ModelCalls != 1 || timing.ModelDurationMS != 12 {
+		t.Fatalf("task timing=%+v err=%v", timing, e)
+	}
+	time.Sleep(2 * time.Millisecond)
+	if e = s.UpdateNode(ctx, node.ID, "completed", "done"); e != nil {
+		t.Fatal(e)
+	}
+	nodes, e := s.Nodes(ctx, task.ID)
+	if e != nil || len(nodes) != 1 || nodes[0].StartedAt == nil || nodes[0].DurationMS < 1 {
+		t.Fatalf("node timing=%+v err=%v", nodes, e)
 	}
 	if _, e = s.PutArtifact(ctx, task.ID, "text/plain", []byte("done")); e != nil {
 		t.Fatalf("artifact after migration: %v", e)

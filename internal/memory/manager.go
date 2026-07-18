@@ -573,7 +573,9 @@ func (m *Manager) rerank(ctx context.Context, q string, xs []Entry) []Entry {
 		view[i] = map[string]any{"id": x.ID, "summary": x.Summary, "type": x.Type, "score": x.Score}
 	}
 	b, _ := json.Marshal(map[string]any{"query": q, "candidates": view})
-	out, e := m.aux.Complete(ctx, `按相关性重排记忆。只输出 {"selected":[{"id":"...","relevance":0.0}]}，只能选择输入 ID。`, string(b))
+	auxCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	out, e := m.aux.Complete(auxCtx, `按相关性重排记忆。只输出 {"selected":[{"id":"...","relevance":0.0}]}，只能选择输入 ID。`, string(b))
+	cancel()
 	if e != nil {
 		return xs
 	}
