@@ -15,6 +15,7 @@ import (
 	"github.com/wbot-dev/wbot/internal/inference"
 	"github.com/wbot-dev/wbot/internal/memory"
 	"github.com/wbot-dev/wbot/internal/model"
+	"github.com/wbot-dev/wbot/internal/permission"
 	"github.com/wbot-dev/wbot/internal/storage"
 	taskgraph "github.com/wbot-dev/wbot/internal/task"
 	"github.com/wbot-dev/wbot/internal/tool"
@@ -29,6 +30,9 @@ type Service struct {
 	history         *history.Manager
 	context         *contextbuilder.Builder
 	scheduler       *taskgraph.Scheduler
+	planner         *Planner
+	gate            taskCompletionGate
+	collector       *EvidenceCollector
 	running         sync.Map
 	maintenanceOnce sync.Once
 }
@@ -40,6 +44,20 @@ type toolExecution struct {
 	originalBytes int
 }
 
+type taskCompletionGate interface {
+	Evaluate(context.Context, domain.Task, string) (domain.GateResult, error)
+	CompleteTask(context.Context, string, string) error
+}
+
+type replanRequested struct{ reason string }
+
+type retryRequested struct{ reason string }
+
+func (e *replanRequested) Error() string { return e.reason }
+func (e *retryRequested) Error() string  { return e.reason }
+
+const maxGraphRevisions = 4 // initial revision plus at most three replans
+
 func New(s config.Settings, st *storage.Store, m model.Generator, t *tool.Registry, mem *memory.Manager, auxiliary ...inference.TextGenerator) *Service {
 	hc := history.Config{Budget: s.MaxContextTokens / 4, MaxLoaded: s.History.MaxLoadedMessages, Recent: s.History.RecentMessages, RecentMin: s.History.RecentMinMessages, ReactiveRecent: s.History.ReactiveRecentMessages, SegmentMessages: s.History.SegmentMessages, SegmentMaxTokens: s.History.SegmentMaxSourceTokens, MergeFactor: s.History.SegmentMergeFactor, SummaryTarget: s.History.SummaryTargetTokens}
 	opts := []history.Option{history.WithConfig(hc)}
@@ -47,7 +65,11 @@ func New(s config.Settings, st *storage.Store, m model.Generator, t *tool.Regist
 		opts = append(opts, history.WithGenerator(auxiliary[0]))
 	}
 	hm := history.New(st, s.MaxContextTokens/4, opts...)
-	svc := &Service{s: s, store: st, model: m, tools: t, memories: mem, history: hm, scheduler: taskgraph.NewScheduler(s.MaxParallelism)}
+	registry := NewVerifierRegistry(permission.New(s, st))
+	collector := NewEvidenceCollector(st, registry)
+	gate := NewCompletionGate(st, collector)
+	planner := NewPlanner(st)
+	svc := &Service{s: s, store: st, model: m, tools: t, memories: mem, history: hm, scheduler: taskgraph.NewScheduler(s.MaxParallelism), planner: planner, gate: gate, collector: collector}
 	svc.context = contextbuilder.New(s, st, mem, hm, t.Definitions)
 	return svc
 }
@@ -68,20 +90,25 @@ func (s *Service) Start(ctx context.Context, sessionID, objective string) (domai
 	}
 	_, e = s.store.AddMessage(ctx, sessionID, t.ID, "user", objective)
 	if e != nil {
+		_ = s.store.UpdateTask(context.Background(), t.ID, "failed", "", e.Error())
 		return t, e
 	}
-	h := storage.NewID("node")
-	m := storage.NewID("node")
-	x := storage.NewID("node")
-	v := storage.NewID("node")
-	nodes := []domain.Node{{ID: h, TaskID: t.ID, Title: "加载会话历史", Description: "在上下文预算内加载并压缩历史", Status: "pending", MaxAttempts: 2}, {ID: m, TaskID: t.ID, Title: "检索长期记忆", Description: "按任务语义检索记忆", Status: "pending", MaxAttempts: 2}, {ID: x, TaskID: t.ID, Title: "执行目标", Description: objective, DependsOn: []string{h, m}, Status: "pending", MaxAttempts: 2}, {ID: v, TaskID: t.ID, Title: "验收结果", Description: "按顶层标准验证交付结果", DependsOn: []string{x}, Status: "pending", MaxAttempts: 2}}
+	// Use Planner with auto-detected complexity (P2: dynamic graph generation)
+	complexity := DetectComplexity(t.Objective)
+	nodes, criteria, revision, err := s.planner.GenerateGraph(ctx, t, complexity)
+	if err != nil {
+		_ = s.store.UpdateTask(context.Background(), t.ID, "failed", "", err.Error())
+		return t, fmt.Errorf("graph generation failed: %w", err)
+	}
 	if e = taskgraph.Validate(nodes); e != nil {
+		_ = s.store.UpdateTask(context.Background(), t.ID, "failed", "", e.Error())
 		return t, e
 	}
-	if e = s.store.CreateGraph(ctx, t.ID, nodes); e != nil {
+	if e = s.store.CreateGraphWithCriteria(ctx, t.ID, nodes, criteria, revision); e != nil {
+		_ = s.store.UpdateTask(context.Background(), t.ID, "failed", "", e.Error())
 		return t, e
 	}
-	s.store.Emit(ctx, sessionID, t.ID, "task.created", map[string]any{"task": t, "nodes": nodes})
+	s.store.Emit(ctx, sessionID, t.ID, "task.created", map[string]any{"task": t, "nodes": nodes, "revision": revision.Version})
 	s.RunAsync(t.ID)
 	return t, nil
 }
@@ -132,57 +159,162 @@ func (s *Service) Run(ctx context.Context, tid string) error {
 	if e != nil {
 		return e
 	}
-	nodes, _ := s.store.Nodes(ctx, tid)
-	nodeID := ""
-	verifyID := ""
-	for _, n := range nodes {
-		if n.Title == "执行目标" {
-			nodeID = n.ID
-		}
-		if n.Title == "验收结果" {
-			verifyID = n.ID
-		}
-	}
 	if t.Status == "waiting_approval" {
 		return nil
 	}
-	ready := taskgraph.Ready(nodes)
-	prep := []domain.Node{}
-	for _, n := range ready {
-		if n.Title == "加载会话历史" || n.Title == "检索长期记忆" {
-			_ = s.store.UpdateNode(ctx, n.ID, "ready", "")
-			prep = append(prep, n)
+
+	for step := 0; step < 128; step++ {
+		current, err := s.store.Task(ctx, tid)
+		if err != nil {
+			return s.fail(ctx, t, "", err)
+		}
+		if current.Status == "waiting_approval" || current.Status == "cancelled" {
+			return nil
+		}
+		nodes, err := s.store.Nodes(ctx, tid)
+		if err != nil {
+			return s.fail(ctx, t, "", err)
+		}
+		ready := taskgraph.Ready(nodes)
+		if len(ready) == 0 {
+			recovered := false
+			for _, node := range nodes {
+				if node.Status == "running" || node.Status == "verifying" || (node.Status == "completed" && effectiveNodeKind(node) == domain.NodeVerify) {
+					if err = s.store.UpdateNode(ctx, node.ID, "ready", node.Result); err != nil {
+						return s.fail(ctx, t, node.ID, err)
+					}
+					recovered = true
+					break
+				}
+			}
+			if recovered {
+				continue
+			}
+			return s.fail(ctx, t, "", fmt.Errorf("task graph is blocked: no ready nodes"))
+		}
+
+		var prep []domain.Node
+		for _, n := range ready {
+			if isPrepNode(n) {
+				if err = s.store.UpdateNode(ctx, n.ID, "ready", ""); err != nil {
+					return s.fail(ctx, t, n.ID, err)
+				}
+				prep = append(prep, n)
+			}
+		}
+		if len(prep) > 0 {
+			if err = s.runPreparation(ctx, t, prep); err != nil {
+				return s.fail(ctx, t, "", err)
+			}
+			continue
+		}
+
+		node := ready[0]
+		node.Kind = effectiveNodeKind(node)
+		if err = s.store.UpdateNode(ctx, node.ID, "ready", ""); err != nil {
+			return s.fail(ctx, t, node.ID, err)
+		}
+		node.Status = "ready"
+		switch node.Kind {
+		case domain.NodeResearch, domain.NodePlan, domain.NodeExecute:
+			err = s.runModelNode(ctx, t, node)
+			if request, ok := err.(*replanRequested); ok {
+				if err = s.applyReplan(ctx, t, request.reason); err != nil {
+					return s.fail(ctx, t, node.ID, err)
+				}
+				continue
+			}
+			if err != nil {
+				return s.fail(ctx, t, node.ID, err)
+			}
+		case domain.NodeVerify:
+			if err = s.runVerifyNode(ctx, t, node, nodes); err != nil {
+				if _, ok := err.(*retryRequested); ok {
+					continue
+				}
+				if request, ok := err.(*replanRequested); ok {
+					if err = s.applyReplan(ctx, t, request.reason); err != nil {
+						return s.fail(ctx, t, node.ID, err)
+					}
+					continue
+				}
+				return s.fail(ctx, t, node.ID, err)
+			}
+			return nil
+		case domain.NodeApproval, domain.NodeWait:
+			if err = s.store.UpdateTask(ctx, t.ID, "waiting_approval", "", node.Description); err != nil {
+				return s.fail(ctx, t, node.ID, err)
+			}
+			return nil
+		default:
+			return s.fail(ctx, t, node.ID, fmt.Errorf("unsupported ready node kind %q", node.Kind))
 		}
 	}
-	errs := s.scheduler.Run(ctx, prep, func(n domain.Node) string { return n.Title }, func(c context.Context, n domain.Node) error {
-		_ = s.store.TransitionNode(c, n.ID, "ready", "running", "")
-		var e error
-		if n.Title == "加载会话历史" {
-			_, _, e = s.history.Select(c, t.SessionID)
+	return s.fail(ctx, t, "", fmt.Errorf("task graph exceeded maximum scheduling steps"))
+}
+
+func isPrepNode(n domain.Node) bool {
+	return n.Kind == domain.NodeLoadHist || n.Kind == domain.NodeRetrieve ||
+		(n.Kind == "" && (n.Title == "加载会话历史" || n.Title == "检索长期记忆"))
+}
+
+func effectiveNodeKind(n domain.Node) domain.NodeKind {
+	if n.Kind != "" {
+		return n.Kind
+	}
+	switch n.Title {
+	case "加载会话历史":
+		return domain.NodeLoadHist
+	case "检索长期记忆":
+		return domain.NodeRetrieve
+	case "执行目标", "执行变更":
+		return domain.NodeExecute
+	case "验收结果":
+		return domain.NodeVerify
+	}
+	return ""
+}
+
+func (s *Service) runPreparation(ctx context.Context, t domain.Task, nodes []domain.Node) error {
+	errs := s.scheduler.Run(ctx, nodes, func(n domain.Node) string { return n.Title }, func(c context.Context, n domain.Node) error {
+		if err := s.store.TransitionNode(c, n.ID, "ready", "running", ""); err != nil {
+			return err
+		}
+		var err error
+		if n.Kind == domain.NodeLoadHist || n.Title == "加载会话历史" {
+			_, _, err = s.history.Select(c, t.SessionID)
 		} else {
-			_, e = s.memories.Retrieve(c, t.Objective, 5)
+			_, err = s.memories.Retrieve(c, t.Objective, 5)
 		}
-		if e == nil {
-			e = s.store.TransitionNode(c, n.ID, "running", "completed", "prepared")
+		if err != nil {
+			return err
 		}
-		return e
+		return s.store.TransitionNode(c, n.ID, "running", "completed", "prepared")
 	})
-	for _, e := range errs {
-		if e != nil {
-			return s.fail(ctx, t, nodeID, e)
+	for _, err := range errs {
+		if err != nil {
+			return err
 		}
 	}
-	_ = s.store.UpdateNode(ctx, nodeID, "ready", "")
-	_ = s.store.TransitionNode(ctx, nodeID, "ready", "running", "")
-	_ = s.store.SaveCheckpoint(ctx, t.ID, map[string]any{"phase": "model_loop", "node_id": nodeID})
-	if e = s.closeInterruptedToolGroup(ctx, t); e != nil {
-		return s.fail(ctx, t, nodeID, e)
+	return nil
+}
+
+func (s *Service) runModelNode(ctx context.Context, t domain.Task, node domain.Node) error {
+	if err := s.store.TransitionNode(ctx, node.ID, "ready", "running", ""); err != nil {
+		return err
+	}
+	if err := s.store.SaveCheckpoint(ctx, t.ID, map[string]any{"phase": "model_loop", "node_id": node.ID, "node_kind": node.Kind}); err != nil {
+		return err
+	}
+	if err := s.closeInterruptedToolGroup(ctx, t); err != nil {
+		return err
 	}
 	for round := 0; round < 30; round++ {
-		built, e := s.context.Build(ctx, contextbuilder.Request{SessionID: t.SessionID, TaskID: t.ID, Objective: t.Objective, Mode: contextbuilder.Normal})
+		built, e := s.context.Build(ctx, contextbuilder.Request{SessionID: t.SessionID, TaskID: t.ID, Objective: node.Description, Mode: contextbuilder.Normal})
 		if e != nil {
-			return s.fail(ctx, t, nodeID, e)
+			return e
 		}
+		built.Messages = append(built.Messages, model.Message{Role: "system", Content: fmt.Sprintf("只执行当前节点 kind=%s title=%q。节点交付要求：%s。不得跳过依赖或宣称整个任务已完成。", node.Kind, node.Title, node.Description)})
 		modelStarted := time.Now()
 		resp, e := s.model.Generate(ctx, built.Messages, s.tools.Definitions())
 		reactiveRetries := s.s.History.ReactiveRetryCount
@@ -191,10 +323,11 @@ func (s *Service) Run(ctx context.Context, tid string) error {
 		}
 		if e != nil && reactiveRetries > 0 && (strings.Contains(strings.ToLower(e.Error()), "context") || strings.Contains(strings.ToLower(e.Error()), "maximum token")) {
 			s.store.Emit(ctx, t.SessionID, t.ID, "context.reactive_retry", map[string]any{"normal_breakdown": built.Breakdown})
-			reactive, x := s.context.Build(ctx, contextbuilder.Request{SessionID: t.SessionID, TaskID: t.ID, Objective: t.Objective, Mode: contextbuilder.Reactive})
+			reactive, x := s.context.Build(ctx, contextbuilder.Request{SessionID: t.SessionID, TaskID: t.ID, Objective: node.Description, Mode: contextbuilder.Reactive})
 			if x != nil {
 				e = x
 			} else {
+				reactive.Messages = append(reactive.Messages, model.Message{Role: "system", Content: fmt.Sprintf("只执行当前节点 kind=%s title=%q：%s", node.Kind, node.Title, node.Description)})
 				resp, e = s.model.Generate(ctx, reactive.Messages, s.tools.Definitions())
 				if e != nil && (strings.Contains(strings.ToLower(e.Error()), "context") || strings.Contains(strings.ToLower(e.Error()), "maximum token")) {
 					e = fmt.Errorf("%w after reactive retry: breakdown=%+v: %v", contextbuilder.ErrBudgetExceeded, reactive.Breakdown, e)
@@ -208,37 +341,45 @@ func (s *Service) Run(ctx context.Context, tid string) error {
 		_ = s.store.RecordModelUsage(ctx, t.ID, s.s.DefaultModel.Name, "executor", resp.Usage, modelDurationMS)
 		if e != nil {
 			s.store.Emit(ctx, t.SessionID, t.ID, "model.failed", map[string]any{"duration_ms": modelDurationMS, "error": e.Error()})
-			return s.fail(ctx, t, nodeID, e)
+			return e
 		}
 		s.store.Emit(ctx, t.SessionID, t.ID, "model.completed", map[string]any{"usage": resp.Usage, "tool_calls": len(resp.ToolCalls), "duration_ms": modelDurationMS})
 		if len(resp.ToolCalls) == 0 {
 			content := strings.TrimSpace(resp.Content)
 			if content == "" {
-				return s.fail(ctx, t, nodeID, fmt.Errorf("model returned empty response"))
+				return fmt.Errorf("model returned empty response")
 			}
-			taskMsgs, _ := s.store.TaskMessages(ctx, t.ID, 200)
-			verification := evaluate(content, taskMsgs)
-			for _, c := range verification.Criteria {
-				_ = s.store.SetCriterion(ctx, t.ID, c.Criterion, c.Passed, c.Reason)
+			if node.Kind == domain.NodeExecute {
+				taskMsgs, err := s.store.TaskMessages(ctx, t.ID, 200)
+				if err != nil {
+					return err
+				}
+				verification := evaluate(content, taskMsgs)
+				for _, c := range verification.Criteria {
+					if err = s.store.SetCriterion(ctx, t.ID, c.Criterion, c.Passed, c.Reason); err != nil {
+						return err
+					}
+				}
+				s.store.Emit(ctx, t.SessionID, t.ID, "task.verification", verification)
+				if !verification.Passed {
+					attempt, err := s.store.IncrementNodeAttempt(ctx, node.ID)
+					if err != nil {
+						return err
+					}
+					node.Attempt = attempt
+					if taskgraph.ShouldReplan(node, taskgraph.ReplanNodeFailed, 2) {
+						return &replanRequested{reason: fmt.Sprintf("node_failed: %s failed verification %d times", node.Title, attempt)}
+					}
+					if _, err = s.store.AddMessage(ctx, t.SessionID, t.ID, "user", "验收未通过，请修正后重新交付。原因：工具错误尚未解决"); err != nil {
+						return err
+					}
+					continue
+				}
+				if _, err = s.store.AddMessage(ctx, t.SessionID, t.ID, "assistant", content); err != nil {
+					return err
+				}
 			}
-			s.store.Emit(ctx, t.SessionID, t.ID, "task.verification", verification)
-			if !verification.Passed {
-				s.store.AddMessage(ctx, t.SessionID, t.ID, "user", "验收未通过，请修正后重新交付。原因：工具错误尚未解决")
-				_ = s.store.SaveCheckpoint(ctx, t.ID, map[string]any{"phase": "replan", "round": round})
-				continue
-			}
-			s.store.AddMessage(ctx, t.SessionID, t.ID, "assistant", content)
-			_ = s.store.TransitionNode(ctx, nodeID, "running", "verifying", content)
-			_ = s.store.TransitionNode(ctx, nodeID, "verifying", "completed", content)
-			_ = s.store.UpdateNode(ctx, verifyID, "ready", "")
-			_ = s.store.TransitionNode(ctx, verifyID, "ready", "running", "")
-			_ = s.store.TransitionNode(ctx, verifyID, "running", "completed", "all criteria passed")
-			s.store.UpdateTask(ctx, t.ID, "completed", content, "")
-			_ = s.store.SaveCheckpoint(ctx, t.ID, map[string]any{"phase": "completed"})
-			s.store.Emit(ctx, t.SessionID, t.ID, "task.completed", map[string]any{"result": content, "verification": verification})
-			_ = s.store.EnqueueMaintenance(ctx, "memory.extract", t.ID, map[string]any{"task_id": t.ID})
-			go s.drainMaintenance(context.Background())
-			return nil
+			return s.store.TransitionNode(ctx, node.ID, "running", "completed", content)
 		}
 		callsJSON, _ := json.Marshal(resp.ToolCalls)
 		_, _ = s.store.AddStructuredMessage(ctx, domain.Message{SessionID: t.SessionID, TaskID: t.ID, Role: "assistant", Content: resp.Content, ContentJSON: callsJSON, Importance: .7})
@@ -265,20 +406,22 @@ func (s *Service) Run(ctx context.Context, tid string) error {
 			for offset, execution := range executions {
 				currentIndex := callIndex + offset
 				if e = s.persistToolExecution(ctx, t, execution); e != nil {
-					return s.fail(ctx, t, nodeID, e)
+					return e
 				}
 				if execution.approval != nil {
-					// Chat completion APIs require one result for every call in the
-					// assistant's tool_calls array. Mark unstarted siblings explicitly.
 					for _, skipped := range resp.ToolCalls[currentIndex+1:] {
 						skippedResult := domain.ToolResult{ToolCallID: skipped.ID, Status: "skipped", Summary: "未执行：同批次工具调用正在等待审批", Retryable: true}
 						raw, _ := json.Marshal(skippedResult)
 						if _, x := s.store.AddStructuredMessage(ctx, domain.Message{SessionID: t.SessionID, TaskID: t.ID, Role: "tool", Content: skippedResult.Summary, ContentJSON: raw, ToolCallID: skipped.ID, ToolName: skipped.Name, Importance: .8}); x != nil {
-							return s.fail(ctx, t, nodeID, x)
+							return x
 						}
 					}
-					_ = s.store.UpdateNode(ctx, nodeID, "waiting_approval", "")
-					s.store.UpdateTask(ctx, t.ID, "waiting_approval", "", "")
+					if e = s.store.UpdateNode(ctx, node.ID, "waiting_approval", ""); e != nil {
+						return e
+					}
+					if e = s.store.UpdateTask(ctx, t.ID, "waiting_approval", "", ""); e != nil {
+						return e
+					}
 					s.store.Emit(ctx, t.SessionID, t.ID, "approval.requested", execution.approval)
 					return nil
 				}
@@ -286,7 +429,118 @@ func (s *Service) Run(ctx context.Context, tid string) error {
 			callIndex = end
 		}
 	}
-	return s.fail(ctx, t, nodeID, fmt.Errorf("agent exceeded maximum rounds"))
+	return fmt.Errorf("agent exceeded maximum rounds")
+}
+
+func (s *Service) runVerifyNode(ctx context.Context, t domain.Task, node domain.Node, nodes []domain.Node) error {
+	if err := s.store.TransitionNode(ctx, node.ID, "ready", "running", ""); err != nil {
+		return err
+	}
+	result, err := s.gate.Evaluate(ctx, t, node.ID)
+	if err != nil {
+		s.store.Emit(ctx, t.SessionID, t.ID, "gate.error", map[string]any{"error": err.Error()})
+		return fmt.Errorf("completion gate failed closed: %w", err)
+	}
+	s.store.Emit(ctx, t.SessionID, t.ID, "gate.evaluated", result)
+	switch result.Action {
+	case domain.ActionComplete:
+		content := ""
+		for _, dep := range node.DependsOn {
+			for _, candidate := range nodes {
+				if candidate.ID == dep && candidate.Kind == domain.NodeExecute {
+					content = candidate.Result
+				}
+			}
+		}
+		if err = s.store.TransitionNode(ctx, node.ID, "running", "completed", result.Reason); err != nil {
+			return err
+		}
+		if err = s.gate.CompleteTask(ctx, t.ID, content); err != nil {
+			return fmt.Errorf("completion gate commit failed: %w", err)
+		}
+		if err = s.store.SaveCheckpoint(ctx, t.ID, map[string]any{"phase": "completed"}); err != nil {
+			return err
+		}
+		s.store.Emit(ctx, t.SessionID, t.ID, "task.completed", map[string]any{"result": content, "gate": result})
+		_ = s.store.EnqueueMaintenance(ctx, "memory.extract", t.ID, map[string]any{"task_id": t.ID})
+		go s.drainMaintenance(context.Background())
+		return nil
+	case domain.ActionRetry:
+		attempt, attemptErr := s.store.IncrementNodeAttempt(ctx, node.ID)
+		if attemptErr != nil {
+			return attemptErr
+		}
+		if node.MaxAttempts > 0 && attempt >= node.MaxAttempts {
+			return s.failVerification(ctx, t, node, fmt.Sprintf("verification retry limit reached: %s", result.Reason))
+		}
+		reset := false
+		for _, dependencyID := range node.DependsOn {
+			for _, candidate := range nodes {
+				if candidate.ID == dependencyID && effectiveNodeKind(candidate) == domain.NodeExecute {
+					if err = s.store.UpdateNode(ctx, candidate.ID, "ready", ""); err != nil {
+						return err
+					}
+					reset = true
+				}
+			}
+		}
+		if !reset {
+			return s.failVerification(ctx, t, node, "verification requested retry but has no executable dependency")
+		}
+		if err = s.store.UpdateNode(ctx, node.ID, "pending", result.Reason); err != nil {
+			return err
+		}
+		return &retryRequested{reason: result.Reason}
+	case domain.ActionReplan:
+		return &replanRequested{reason: fmt.Sprintf("evaluator_%s: %s", result.Action, result.Reason)}
+	case domain.ActionFail:
+		return s.failVerification(ctx, t, node, result.Reason)
+	case domain.ActionWaitForUser:
+		if err = s.store.UpdateNode(ctx, node.ID, "waiting_external", result.Reason); err != nil {
+			return err
+		}
+		return s.store.UpdateTask(ctx, t.ID, "waiting_approval", "", result.Reason)
+	case domain.ActionWaitForExternal:
+		if err = s.store.UpdateNode(ctx, node.ID, "waiting_external", result.Reason); err != nil {
+			return err
+		}
+		return s.store.UpdateTask(ctx, t.ID, "waiting_external", "", result.Reason)
+	default:
+		return fmt.Errorf("completion gate returned unknown action %q", result.Action)
+	}
+}
+
+func (s *Service) failVerification(ctx context.Context, t domain.Task, node domain.Node, reason string) error {
+	if reason == "" {
+		reason = "acceptance criteria failed"
+	}
+	if err := s.store.UpdateNode(ctx, node.ID, "failed", reason); err != nil {
+		return err
+	}
+	if err := s.store.UpdateTask(ctx, t.ID, "failed", "", reason); err != nil {
+		return err
+	}
+	s.store.Emit(ctx, t.SessionID, t.ID, "task.failed", map[string]any{"error": reason, "source": "completion_gate"})
+	return nil
+}
+
+func (s *Service) applyReplan(ctx context.Context, t domain.Task, reason string) error {
+	revisions, err := s.store.GraphRevisions(ctx, t.ID)
+	if err != nil {
+		return err
+	}
+	if len(revisions) >= maxGraphRevisions {
+		return fmt.Errorf("replan limit reached after %d graph revisions: %s", len(revisions), reason)
+	}
+	nodes, criteria, revision, err := s.planner.Replan(ctx, t, reason)
+	if err != nil {
+		return err
+	}
+	if err = s.store.ReplaceUnfinishedGraph(ctx, t.ID, nodes, criteria, revision); err != nil {
+		return err
+	}
+	s.store.Emit(ctx, t.SessionID, t.ID, "task.replanned", map[string]any{"revision": revision.Version, "reason": reason, "nodes": nodes})
+	return s.store.SaveCheckpoint(ctx, t.ID, map[string]any{"phase": "replan", "revision": revision.Version, "reason": reason})
 }
 
 func (s *Service) executeReadBatch(ctx context.Context, task domain.Task, calls []domain.ToolCall) []toolExecution {
@@ -297,8 +551,8 @@ func (s *Service) executeReadBatch(ctx context.Context, task domain.Task, calls 
 	if limit < 1 {
 		limit = 1
 	}
-	if limit > 4 {
-		limit = 4
+	if limit > 8 {
+		limit = 8
 	}
 	return executeToolBatch(ctx, calls, limit, func(callCtx context.Context, call domain.ToolCall) toolExecution {
 		return s.executeTool(callCtx, task, call)
@@ -336,7 +590,36 @@ func executeToolBatch(ctx context.Context, calls []domain.ToolCall, limit int, r
 }
 
 func (s *Service) executeTool(ctx context.Context, task domain.Task, call domain.ToolCall) toolExecution {
-	result, approval := s.tools.Execute(ctx, task.ID, call)
+	// Hard per-tool timeout: prevents a hung tool from blocking the task forever.
+	toolTimeout := 120 * time.Second
+	toolCtx, toolCancel := context.WithTimeout(ctx, toolTimeout)
+	defer toolCancel()
+
+	type toolOut struct {
+		result   domain.ToolResult
+		approval *domain.Approval
+	}
+	done := make(chan toolOut, 1)
+	go func() {
+		r, a := s.tools.Execute(toolCtx, task.ID, call)
+		done <- toolOut{result: r, approval: a}
+	}()
+
+	var result domain.ToolResult
+	var approval *domain.Approval
+	select {
+	case out := <-done:
+		result, approval = out.result, out.approval
+	case <-toolCtx.Done():
+		result = domain.ToolResult{
+			ToolCallID: call.ID,
+			Status:     "error",
+			Summary:    fmt.Sprintf("工具调用超时（%v）", toolTimeout),
+			Retryable:  true,
+			Error:      &domain.ToolError{Code: "TOOL_TIMEOUT", Message: fmt.Sprintf("tool execution exceeded %v", toolTimeout)},
+		}
+		s.store.Emit(ctx, task.SessionID, task.ID, "tool.timeout", map[string]any{"tool": call.Name, "timeout": toolTimeout.String()})
+	}
 	rawResult, _ := json.Marshal(result)
 	if len(rawResult) > 8*1024 {
 		if aid, err := s.store.PutArtifact(ctx, task.ID, "application/json", rawResult); err == nil {
@@ -407,7 +690,7 @@ func (s *Service) Resume(ctx context.Context, tid string) {
 	nodes, _ := s.store.Nodes(ctx, tid)
 	for _, n := range nodes {
 		if n.Status == "waiting_approval" {
-			_ = s.store.UpdateNode(ctx, n.ID, "running", "")
+			_ = s.store.UpdateNode(ctx, n.ID, "ready", "")
 		}
 	}
 	s.RunAsync(tid)

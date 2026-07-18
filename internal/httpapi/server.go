@@ -193,12 +193,52 @@ func (s *Server) message(w http.ResponseWriter, r *http.Request) {
 		bad(w, fmt.Errorf("content is required"))
 		return
 	}
-	x, e := s.agent.Start(r.Context(), segment(r.URL.Path, "sessions"), in.Content)
+	sid := segment(r.URL.Path, "sessions")
+	x, e := s.agent.Start(r.Context(), sid, in.Content)
 	if e != nil {
 		respond(w, nil, e)
 		return
 	}
+	// Auto-title: rename the session from "新会话" to a snippet of the first message.
+	go s.autoTitleSession(sid, in.Content)
 	write(w, 202, x)
+}
+
+func (s *Server) autoTitleSession(sid, content string) {
+	sess, err := s.store.Session(context.Background(), sid)
+	if err != nil || sess.Title != "新会话" {
+		return
+	}
+	title := sessionTitle(content)
+	if title == "" || title == "新会话" {
+		return
+	}
+	_, _ = s.store.RenameSession(context.Background(), sid, title)
+}
+
+func sessionTitle(content string) string {
+	// Strip leading whitespace / newlines / markdown headings
+	t := strings.TrimSpace(content)
+	t = strings.TrimLeft(t, "#*> -")
+	t = strings.TrimSpace(t)
+	if t == "" {
+		return ""
+	}
+	runes := []rune(t)
+	max := 10
+	if len(runes) <= max {
+		return t
+	}
+	// Try to break at a natural boundary
+	cut := max
+	for i := max; i > max-8 && i > 0; i-- {
+		r := runes[i]
+		if r == ' ' || r == '，' || r == '、' || r == '。' || r == '；' || r == ':' || r == '：' || r == '\n' {
+			cut = i
+			break
+		}
+	}
+	return strings.TrimSpace(string(runes[:cut])) + "…"
 }
 func (s *Server) task(w http.ResponseWriter, r *http.Request) {
 	x, e := s.store.Task(r.Context(), segment(r.URL.Path, "tasks"))
@@ -209,7 +249,9 @@ func (s *Server) task(w http.ResponseWriter, r *http.Request) {
 	nodes, _ := s.store.Nodes(r.Context(), x.ID)
 	timing, _ := s.store.TaskTiming(r.Context(), x.ID)
 	criteria, _ := s.store.Criteria(r.Context(), x.ID)
-	write(w, 200, map[string]any{"task": x, "nodes": nodes, "timing": timing, "acceptance_criteria": criteria})
+	evidence, _ := s.store.EvidenceByTask(r.Context(), x.ID)
+	revisions, _ := s.store.GraphRevisions(r.Context(), x.ID)
+	write(w, 200, map[string]any{"task": x, "nodes": nodes, "timing": timing, "acceptance_criteria": criteria, "evidence": evidence, "graph_revisions": revisions})
 }
 func (s *Server) cancel(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {

@@ -29,11 +29,11 @@ func main() {
 	defer st.Close()
 	mainModel := model.New(s.DefaultModel)
 	advisor := model.New(s.AdvisorModel)
-	mem := memory.New(s.DataRoot+"/memory", memory.WithConfig(memory.ConfigFrom(s.Memory)), memory.WithGenerator(advisor))
+	mem := memory.New(s.DataRoot+"/memory", memory.WithConfig(memory.ConfigFrom(s.Memory)), memory.WithGenerator(mainModel))
 	defer mem.Close()
 	perm := permission.New(s, st)
 	tools := tool.New(s, st, perm, mem, advisor)
-	svc := agent.New(s, st, mainModel, tools, mem, advisor)
+	svc := agent.New(s, st, mainModel, tools, mem, mainModel) // use main (fast) model for history summarization, not advisor
 	if e = svc.Recover(context.Background()); e != nil {
 		log.Fatal(e)
 	}

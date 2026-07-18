@@ -60,7 +60,10 @@ CREATE TABLE IF NOT EXISTS tool_calls(id TEXT PRIMARY KEY,task_id TEXT NOT NULL,
 CREATE TABLE IF NOT EXISTS artifacts(id TEXT PRIMARY KEY,task_id TEXT,kind TEXT NOT NULL DEFAULT '',mime_type TEXT NOT NULL,path TEXT NOT NULL,size INTEGER NOT NULL,sha256 TEXT NOT NULL,created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT,trace_id TEXT NOT NULL DEFAULT '',session_id TEXT NOT NULL,task_id TEXT,node_id TEXT NOT NULL DEFAULT '',type TEXT NOT NULL,payload TEXT NOT NULL,created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS model_usage(id INTEGER PRIMARY KEY AUTOINCREMENT,task_id TEXT NOT NULL,model TEXT NOT NULL,role TEXT NOT NULL,input_tokens INTEGER NOT NULL DEFAULT 0,output_tokens INTEGER NOT NULL DEFAULT 0,total_tokens INTEGER NOT NULL DEFAULT 0,prompt_tokens INTEGER NOT NULL DEFAULT 0,completion_tokens INTEGER NOT NULL DEFAULT 0,duration_ms INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL);
-	CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id,id); CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status); CREATE INDEX IF NOT EXISTS idx_history_segments_active ON history_segments(session_id,level,status,first_seq); CREATE INDEX IF NOT EXISTS idx_maintenance_jobs_ready ON maintenance_jobs(status,next_run_at);`)
+CREATE TABLE IF NOT EXISTS evidence(id TEXT PRIMARY KEY,task_id TEXT NOT NULL,node_id TEXT NOT NULL,criterion_id TEXT NOT NULL,type TEXT NOT NULL,source TEXT NOT NULL,artifact_id TEXT NOT NULL DEFAULT '',digest TEXT NOT NULL,summary TEXT NOT NULL,passed INTEGER NOT NULL DEFAULT 0,collected_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS graph_revisions(id TEXT PRIMARY KEY,task_id TEXT NOT NULL,version INTEGER NOT NULL,reason TEXT NOT NULL,planner_model TEXT NOT NULL,source_event TEXT NOT NULL DEFAULT '',nodes_json TEXT NOT NULL,created_at TEXT NOT NULL,UNIQUE(task_id,version));
+CREATE TABLE IF NOT EXISTS acceptance_criteria(id TEXT PRIMARY KEY,task_id TEXT NOT NULL,node_id TEXT NOT NULL DEFAULT '',type TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',required INTEGER NOT NULL DEFAULT 1,config TEXT NOT NULL DEFAULT '{}',status TEXT NOT NULL DEFAULT 'pending',reason TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL);
+	CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id,id); CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status); CREATE INDEX IF NOT EXISTS idx_history_segments_active ON history_segments(session_id,level,status,first_seq); CREATE INDEX IF NOT EXISTS idx_maintenance_jobs_ready ON maintenance_jobs(status,next_run_at); CREATE INDEX IF NOT EXISTS idx_evidence_task ON evidence(task_id); CREATE INDEX IF NOT EXISTS idx_acceptance_criteria_task ON acceptance_criteria(task_id); CREATE INDEX IF NOT EXISTS idx_graph_revisions_task ON graph_revisions(task_id,version);`)
 	if err != nil {
 		return err
 	}
@@ -81,6 +84,7 @@ func (s *Store) migrateLegacy() error {
 		{"messages", "task_id", "TEXT"}, {"messages", "metadata", "TEXT"}, {"messages", "seq", "INTEGER NOT NULL DEFAULT 0"}, {"messages", "content_json", "TEXT"}, {"messages", "token_count", "INTEGER NOT NULL DEFAULT 0"}, {"messages", "content_hash", "TEXT NOT NULL DEFAULT ''"}, {"messages", "compaction_state", "TEXT NOT NULL DEFAULT 'raw'"}, {"messages", "parent_message_id", "TEXT"}, {"messages", "tool_call_id", "TEXT"}, {"messages", "tool_name", "TEXT"}, {"messages", "artifact_ids", "TEXT NOT NULL DEFAULT '[]'"}, {"messages", "importance", "REAL NOT NULL DEFAULT 0.5"},
 		{"tasks", "result", "TEXT NOT NULL DEFAULT ''"}, {"tasks", "error", "TEXT NOT NULL DEFAULT ''"}, {"tasks", "updated_at", "TEXT NOT NULL DEFAULT ''"}, {"tasks", "completed_at", "TEXT"},
 		{"task_nodes", "description", "TEXT NOT NULL DEFAULT ''"}, {"task_nodes", "depends_on", "TEXT NOT NULL DEFAULT '[]'"}, {"task_nodes", "risk_level", "TEXT NOT NULL DEFAULT 'low'"}, {"task_nodes", "attempt", "INTEGER NOT NULL DEFAULT 0"}, {"task_nodes", "max_attempts", "INTEGER NOT NULL DEFAULT 2"}, {"task_nodes", "result", "TEXT NOT NULL DEFAULT ''"}, {"task_nodes", "created_at", "TEXT NOT NULL DEFAULT ''"}, {"task_nodes", "started_at", "TEXT"}, {"task_nodes", "updated_at", "TEXT NOT NULL DEFAULT ''"},
+		{"task_nodes", "kind", "TEXT NOT NULL DEFAULT ''"}, {"task_nodes", "inputs", "TEXT NOT NULL DEFAULT '[]'"}, {"task_nodes", "outputs", "TEXT NOT NULL DEFAULT '[]'"}, {"task_nodes", "criteria_ids", "TEXT NOT NULL DEFAULT '[]'"}, {"task_nodes", "timeout_ms", "INTEGER NOT NULL DEFAULT 0"}, {"task_nodes", "assigned_role", "TEXT NOT NULL DEFAULT ''"},
 		{"approvals", "session_id", "TEXT NOT NULL DEFAULT ''"}, {"approvals", "node_id", "TEXT"}, {"approvals", "tool_call_id", "TEXT NOT NULL DEFAULT ''"}, {"approvals", "arguments_digest", "TEXT NOT NULL DEFAULT ''"}, {"approvals", "risk_level", "TEXT NOT NULL DEFAULT 'L2'"}, {"approvals", "reason", "TEXT NOT NULL DEFAULT ''"}, {"approvals", "decided_at", "TEXT"},
 		{"events", "trace_id", "TEXT NOT NULL DEFAULT ''"}, {"events", "task_id", "TEXT"}, {"events", "node_id", "TEXT NOT NULL DEFAULT ''"},
 		{"artifacts", "task_id", "TEXT"}, {"artifacts", "kind", "TEXT NOT NULL DEFAULT ''"}, {"artifacts", "mime_type", "TEXT NOT NULL DEFAULT 'application/octet-stream'"},
@@ -560,10 +564,45 @@ func (s *Store) CreateTask(ctx context.Context, sid, objective string) (domain.T
 
 func (s *Store) HasActiveTask(ctx context.Context, sid string) (bool, error) {
 	var active bool
-	e := s.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM tasks WHERE session_id=? AND status IN ('running','waiting_approval'))", sid).Scan(&active)
+	e := s.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM tasks WHERE session_id=? AND status IN ('running','waiting_approval','waiting_external'))", sid).Scan(&active)
 	return active, e
 }
 func (s *Store) Criteria(ctx context.Context, tid string) ([]domain.AcceptanceCriterion, error) {
+	rows, e := s.db.QueryContext(ctx, "SELECT id,task_id,COALESCE(node_id,''),type,description,required,config,status,reason FROM acceptance_criteria WHERE task_id=? ORDER BY created_at", tid)
+	if e != nil {
+		// Fallback to old table format if new table is empty or doesn't exist
+		return s.criteriaLegacy(ctx, tid)
+	}
+	defer rows.Close()
+	var out []domain.AcceptanceCriterion
+	for rows.Next() {
+		var c domain.AcceptanceCriterion
+		var typ string
+		var required int
+		var config string
+		if e = rows.Scan(&c.ID, &c.TaskID, &c.NodeID, &typ, &c.Description, &required, &config, &c.Status, &c.Reason); e != nil {
+			return nil, e
+		}
+		c.Type = domain.CriterionType(typ)
+		c.Required = required != 0
+		if config != "" && config != "{}" {
+			c.Config = json.RawMessage(config)
+			var metadata struct {
+				EvidenceIDs []string `json:"evidence_ids"`
+			}
+			if json.Unmarshal([]byte(config), &metadata) == nil {
+				c.EvidenceIDs = metadata.EvidenceIDs
+			}
+		}
+		out = append(out, c)
+	}
+	if len(out) == 0 {
+		return s.criteriaLegacy(ctx, tid)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) criteriaLegacy(ctx context.Context, tid string) ([]domain.AcceptanceCriterion, error) {
 	rows, e := s.db.QueryContext(ctx, "SELECT task_id,criterion,passed,reason FROM task_criteria WHERE task_id=? ORDER BY rowid", tid)
 	if e != nil {
 		return nil, e
@@ -571,23 +610,48 @@ func (s *Store) Criteria(ctx context.Context, tid string) ([]domain.AcceptanceCr
 	defer rows.Close()
 	var out []domain.AcceptanceCriterion
 	for rows.Next() {
-		var c domain.AcceptanceCriterion
-		if e = rows.Scan(&c.TaskID, &c.Criterion, &c.Passed, &c.Reason); e != nil {
+		var taskID, criterion, reason string
+		var passed bool
+		if e = rows.Scan(&taskID, &criterion, &passed, &reason); e != nil {
 			return nil, e
 		}
-		out = append(out, c)
+		status := "pending"
+		if passed {
+			status = "passed"
+		}
+		typ := domain.CriterionModelRubric
+		if criterion == "不存在未处理的工具错误" {
+			typ = domain.CriterionToolResult
+		}
+		out = append(out, domain.AcceptanceCriterion{
+			ID: id("ac"), TaskID: taskID, Type: typ,
+			Description: criterion, Required: true, Status: status, Reason: reason,
+		})
 	}
 	return out, rows.Err()
 }
+
 func (s *Store) SetCriterion(ctx context.Context, tid, criterion string, passed bool, reason string) error {
+	// Write to both old and new tables during transition period
 	_, e := s.db.ExecContext(ctx, "UPDATE task_criteria SET passed=?,reason=? WHERE task_id=? AND criterion=?", passed, reason, tid, criterion)
+	if e != nil {
+		return e
+	}
+	status := "failed"
+	if passed {
+		status = "passed"
+	}
+	_, e = s.db.ExecContext(ctx, "UPDATE acceptance_criteria SET status=?,reason=? WHERE task_id=? AND description=?", status, reason, tid, criterion)
 	return e
 }
 func (s *Store) CreateNode(ctx context.Context, tid, title string) (domain.Node, error) {
 	n := domain.Node{ID: id("node"), TaskID: tid, Title: title, Description: title, Status: "running", RiskLevel: "low", MaxAttempts: 2}
 	b, _ := json.Marshal(n.DependsOn)
+	inputs, _ := json.Marshal(n.Inputs)
+	outputs, _ := json.Marshal(n.Outputs)
+	cids, _ := json.Marshal(n.CriteriaIDs)
 	ts := now()
-	_, e := s.db.ExecContext(ctx, "INSERT INTO task_nodes(id,task_id,title,description,status,depends_on,risk_level,attempt,max_attempts,result,created_at,started_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", n.ID, n.TaskID, n.Title, n.Description, n.Status, string(b), n.RiskLevel, n.Attempt, n.MaxAttempts, n.Result, ts, ts, ts)
+	_, e := s.db.ExecContext(ctx, "INSERT INTO task_nodes(id,task_id,title,description,status,depends_on,risk_level,attempt,max_attempts,result,kind,inputs,outputs,criteria_ids,timeout_ms,assigned_role,created_at,started_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", n.ID, n.TaskID, n.Title, n.Description, n.Status, string(b), n.RiskLevel, n.Attempt, n.MaxAttempts, n.Result, string(n.Kind), string(inputs), string(outputs), string(cids), int64(n.Timeout/time.Millisecond), n.AssignedRole, ts, ts, ts)
 	return n, e
 }
 func (s *Store) CreateGraph(ctx context.Context, tid string, nodes []domain.Node) error {
@@ -596,8 +660,18 @@ func (s *Store) CreateGraph(ctx context.Context, tid string, nodes []domain.Node
 		return e
 	}
 	defer tx.Rollback()
+	if e = insertGraphTx(ctx, tx, tid, nodes); e != nil {
+		return e
+	}
+	return tx.Commit()
+}
+
+func insertGraphTx(ctx context.Context, tx *sql.Tx, tid string, nodes []domain.Node) error {
 	for _, n := range nodes {
 		b, _ := json.Marshal(n.DependsOn)
+		inputs, _ := json.Marshal(n.Inputs)
+		outputs, _ := json.Marshal(n.Outputs)
+		cids, _ := json.Marshal(n.CriteriaIDs)
 		if n.TaskID == "" {
 			n.TaskID = tid
 		}
@@ -608,11 +682,157 @@ func (s *Store) CreateGraph(ctx context.Context, tid string, nodes []domain.Node
 			n.RiskLevel = "low"
 		}
 		ts := now()
-		if _, e = tx.ExecContext(ctx, "INSERT INTO task_nodes(id,task_id,title,description,status,depends_on,risk_level,attempt,max_attempts,result,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", n.ID, n.TaskID, n.Title, n.Description, n.Status, string(b), n.RiskLevel, n.Attempt, n.MaxAttempts, n.Result, ts, ts); e != nil {
-			return e
+		if _, err := tx.ExecContext(ctx, "INSERT INTO task_nodes(id,task_id,title,description,status,depends_on,risk_level,attempt,max_attempts,result,kind,inputs,outputs,criteria_ids,timeout_ms,assigned_role,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", n.ID, n.TaskID, n.Title, n.Description, n.Status, string(b), n.RiskLevel, n.Attempt, n.MaxAttempts, n.Result, string(n.Kind), string(inputs), string(outputs), string(cids), int64(n.Timeout/time.Millisecond), n.AssignedRole, ts, ts); err != nil {
+			return err
 		}
 	}
+	return nil
+}
+
+func insertCriteriaTx(ctx context.Context, tx *sql.Tx, criteria []domain.AcceptanceCriterion) error {
+	for _, c := range criteria {
+		if c.ID == "" {
+			c.ID = id("ac")
+		}
+		if c.Status == "" {
+			c.Status = "pending"
+		}
+		required := 0
+		if c.Required {
+			required = 1
+		}
+		config := string(c.Config)
+		if config == "" {
+			config = "{}"
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO acceptance_criteria(id,task_id,node_id,type,description,required,config,status,reason,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+			c.ID, c.TaskID, c.NodeID, string(c.Type), c.Description, required, config, c.Status, c.Reason, now()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// CreateGraphWithCriteria persists the executable graph and its acceptance
+// contract atomically, so nodes can never reference missing criteria.
+func (s *Store) CreateGraphWithCriteria(ctx context.Context, tid string, nodes []domain.Node, criteria []domain.AcceptanceCriterion, revision domain.GraphRevision) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err = insertGraphTx(ctx, tx, tid, nodes); err != nil {
+		return err
+	}
+	if err = insertCriteriaTx(ctx, tx, criteria); err != nil {
+		return err
+	}
+	if err = insertGraphRevisionTx(ctx, tx, revision); err != nil {
+		return err
+	}
 	return tx.Commit()
+}
+
+// ReplaceUnfinishedGraph installs a new revision while retaining completed
+// nodes and all historical evidence. Required acceptance criteria are an
+// invariant across revisions: callers may rebind them to new nodes, but may
+// not remove them or weaken their definitions.
+func (s *Store) ReplaceUnfinishedGraph(ctx context.Context, tid string, nodes []domain.Node, criteria []domain.AcceptanceCriterion, revision domain.GraphRevision) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, "SELECT id,type,description,config FROM acceptance_criteria WHERE task_id=? AND required=1", tid)
+	if err != nil {
+		return err
+	}
+	type requiredContract struct {
+		typ, description, config string
+	}
+	required := make(map[string]requiredContract)
+	for rows.Next() {
+		var id string
+		var contract requiredContract
+		if err = rows.Scan(&id, &contract.typ, &contract.description, &contract.config); err != nil {
+			rows.Close()
+			return err
+		}
+		required[id] = contract
+	}
+	if err = rows.Close(); err != nil {
+		return err
+	}
+	if err = rows.Err(); err != nil {
+		return err
+	}
+	for _, c := range criteria {
+		contract, ok := required[c.ID]
+		if !ok {
+			continue
+		}
+		config := string(c.Config)
+		if config == "" {
+			config = "{}"
+		}
+		if !c.Required || string(c.Type) != contract.typ || c.Description != contract.description || config != contract.config {
+			return fmt.Errorf("required acceptance criterion %s was weakened during replan", c.ID)
+		}
+		delete(required, c.ID)
+	}
+	for id := range required {
+		return fmt.Errorf("required acceptance criterion %s was removed during replan", id)
+	}
+	completedIDs := make(map[string]bool)
+	completedRows, err := tx.QueryContext(ctx, "SELECT id FROM task_nodes WHERE task_id=? AND status='completed'", tid)
+	if err != nil {
+		return err
+	}
+	for completedRows.Next() {
+		var id string
+		if err = completedRows.Scan(&id); err != nil {
+			completedRows.Close()
+			return err
+		}
+		completedIDs[id] = true
+	}
+	if err = completedRows.Close(); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, "DELETE FROM task_nodes WHERE task_id=? AND status!='completed'", tid); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, "UPDATE task_nodes SET criteria_ids='[]' WHERE task_id=?", tid); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, "DELETE FROM acceptance_criteria WHERE task_id=?", tid); err != nil {
+		return err
+	}
+	nodesToInsert := make([]domain.Node, 0, len(nodes))
+	for _, node := range nodes {
+		if !completedIDs[node.ID] {
+			nodesToInsert = append(nodesToInsert, node)
+		}
+	}
+	if err = insertGraphTx(ctx, tx, tid, nodesToInsert); err != nil {
+		return err
+	}
+	if err = insertCriteriaTx(ctx, tx, criteria); err != nil {
+		return err
+	}
+	if err = insertGraphRevisionTx(ctx, tx, revision); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) IncrementNodeAttempt(ctx context.Context, nid string) (int, error) {
+	if _, err := s.db.ExecContext(ctx, "UPDATE task_nodes SET attempt=attempt+1,updated_at=? WHERE id=?", now(), nid); err != nil {
+		return 0, err
+	}
+	var attempt int
+	err := s.db.QueryRowContext(ctx, "SELECT attempt FROM task_nodes WHERE id=?", nid).Scan(&attempt)
+	return attempt, err
 }
 func (s *Store) UpdateNode(ctx context.Context, nid, status, result string) error {
 	stamp := now()
@@ -653,7 +873,7 @@ func (s *Store) TaskTiming(ctx context.Context, tid string) (domain.TaskTiming, 
 	return out, e
 }
 func (s *Store) Nodes(ctx context.Context, tid string) ([]domain.Node, error) {
-	rows, e := s.db.QueryContext(ctx, "SELECT id,task_id,title,description,status,depends_on,risk_level,attempt,max_attempts,result,created_at,started_at,updated_at FROM task_nodes WHERE task_id=?", tid)
+	rows, e := s.db.QueryContext(ctx, `SELECT id,task_id,title,description,status,depends_on,risk_level,attempt,max_attempts,result,COALESCE(kind,''),COALESCE(inputs,'[]'),COALESCE(outputs,'[]'),COALESCE(criteria_ids,'[]'),COALESCE(timeout_ms,0),COALESCE(assigned_role,''),created_at,started_at,updated_at FROM task_nodes WHERE task_id=?`, tid)
 	if e != nil {
 		return nil, e
 	}
@@ -661,12 +881,20 @@ func (s *Store) Nodes(ctx context.Context, tid string) ([]domain.Node, error) {
 	out := make([]domain.Node, 0)
 	for rows.Next() {
 		var n domain.Node
-		var d, created, updated string
+		var d, created, updated, kind, inputs, outputs, cids string
+		var timeoutMS int64
 		var started sql.NullString
-		if e = rows.Scan(&n.ID, &n.TaskID, &n.Title, &n.Description, &n.Status, &d, &n.RiskLevel, &n.Attempt, &n.MaxAttempts, &n.Result, &created, &started, &updated); e != nil {
+		if e = rows.Scan(&n.ID, &n.TaskID, &n.Title, &n.Description, &n.Status, &d, &n.RiskLevel, &n.Attempt, &n.MaxAttempts, &n.Result, &kind, &inputs, &outputs, &cids, &timeoutMS, &n.AssignedRole, &created, &started, &updated); e != nil {
 			return nil, e
 		}
 		json.Unmarshal([]byte(d), &n.DependsOn)
+		n.Kind = domain.NodeKind(kind)
+		json.Unmarshal([]byte(inputs), &n.Inputs)
+		json.Unmarshal([]byte(outputs), &n.Outputs)
+		json.Unmarshal([]byte(cids), &n.CriteriaIDs)
+		if timeoutMS > 0 {
+			n.Timeout = time.Duration(timeoutMS) * time.Millisecond
+		}
 		n.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 		n.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
 		if started.Valid {
@@ -924,6 +1152,40 @@ func (s *Store) Artifact(ctx context.Context, aid string) (string, string, error
 	e := s.db.QueryRowContext(ctx, "SELECT path,mime_type FROM artifacts WHERE id=?", aid).Scan(&p, &m)
 	return p, m, e
 }
+
+func (s *Store) TaskArtifacts(ctx context.Context, tid string) ([]string, error) {
+	rows, e := s.db.QueryContext(ctx, "SELECT id FROM artifacts WHERE task_id=? ORDER BY created_at", tid)
+	if e != nil {
+		return nil, e
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if e = rows.Scan(&id); e != nil {
+			return nil, e
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+func (s *Store) TaskArtifactInfo(ctx context.Context, tid string) ([]domain.ArtifactInfo, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT id,mime_type,path,size FROM artifacts WHERE task_id=? ORDER BY created_at", tid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.ArtifactInfo
+	for rows.Next() {
+		var item domain.ArtifactInfo
+		if err = rows.Scan(&item.ID, &item.MimeType, &item.Path, &item.Size); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
 func (s *Store) DB() *sql.DB { return s.db }
 func (s *Store) Metrics(ctx context.Context) (map[string]any, error) {
 	out := map[string]any{}
@@ -935,6 +1197,216 @@ func (s *Store) Metrics(ctx context.Context) (map[string]any, error) {
 		out[k] = n
 	}
 	return out, nil
+}
+
+// ---- Evidence (P0) ----
+
+func (s *Store) SaveEvidence(ctx context.Context, ev domain.Evidence) error {
+	if ev.ID == "" {
+		ev.ID = id("ev")
+	}
+	if ev.CollectedAt.IsZero() {
+		ev.CollectedAt = time.Now().UTC()
+	}
+	passed := 0
+	if ev.Passed {
+		passed = 1
+	}
+	_, e := s.db.ExecContext(ctx, "INSERT INTO evidence(id,task_id,node_id,criterion_id,type,source,artifact_id,digest,summary,passed,collected_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+		ev.ID, ev.TaskID, ev.NodeID, ev.CriterionID, ev.Type, ev.Source, ev.ArtifactID, ev.Digest, ev.Summary, passed, ev.CollectedAt.Format(time.RFC3339Nano))
+	return e
+}
+
+func (s *Store) EvidenceByTask(ctx context.Context, tid string) ([]domain.Evidence, error) {
+	rows, e := s.db.QueryContext(ctx, "SELECT id,task_id,node_id,criterion_id,type,source,artifact_id,digest,summary,passed,collected_at FROM evidence WHERE task_id=? ORDER BY collected_at", tid)
+	if e != nil {
+		return nil, e
+	}
+	defer rows.Close()
+	var out []domain.Evidence
+	for rows.Next() {
+		var ev domain.Evidence
+		var passed int
+		var ts string
+		if e = rows.Scan(&ev.ID, &ev.TaskID, &ev.NodeID, &ev.CriterionID, &ev.Type, &ev.Source, &ev.ArtifactID, &ev.Digest, &ev.Summary, &passed, &ts); e != nil {
+			return nil, e
+		}
+		ev.Passed = passed != 0
+		ev.CollectedAt, _ = time.Parse(time.RFC3339Nano, ts)
+		out = append(out, ev)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) EvidenceByNode(ctx context.Context, nid string) ([]domain.Evidence, error) {
+	rows, e := s.db.QueryContext(ctx, "SELECT id,task_id,node_id,criterion_id,type,source,artifact_id,digest,summary,passed,collected_at FROM evidence WHERE node_id=? ORDER BY collected_at", nid)
+	if e != nil {
+		return nil, e
+	}
+	defer rows.Close()
+	var out []domain.Evidence
+	for rows.Next() {
+		var ev domain.Evidence
+		var passed int
+		var ts string
+		if e = rows.Scan(&ev.ID, &ev.TaskID, &ev.NodeID, &ev.CriterionID, &ev.Type, &ev.Source, &ev.ArtifactID, &ev.Digest, &ev.Summary, &passed, &ts); e != nil {
+			return nil, e
+		}
+		ev.Passed = passed != 0
+		ev.CollectedAt, _ = time.Parse(time.RFC3339Nano, ts)
+		out = append(out, ev)
+	}
+	return out, rows.Err()
+}
+
+// ---- Acceptance Criteria v2 (P0) ----
+
+func (s *Store) CreateAcceptanceCriterion(ctx context.Context, c domain.AcceptanceCriterion) error {
+	if c.ID == "" {
+		c.ID = id("ac")
+	}
+	if c.Status == "" {
+		c.Status = "pending"
+	}
+	required := 1
+	if !c.Required {
+		required = 0
+	}
+	config := string(c.Config)
+	if config == "" {
+		config = "{}"
+	}
+	_, e := s.db.ExecContext(ctx, "INSERT INTO acceptance_criteria(id,task_id,node_id,type,description,required,config,status,reason,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+		c.ID, c.TaskID, c.NodeID, string(c.Type), c.Description, required, config, c.Status, c.Reason, now())
+	return e
+}
+
+func (s *Store) CreateAcceptanceCriteriaBatch(ctx context.Context, criteria []domain.AcceptanceCriterion) error {
+	tx, e := s.db.BeginTx(ctx, nil)
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	for _, c := range criteria {
+		if c.ID == "" {
+			c.ID = id("ac")
+		}
+		if c.Status == "" {
+			c.Status = "pending"
+		}
+		required := 1
+		if !c.Required {
+			required = 0
+		}
+		config := string(c.Config)
+		if config == "" {
+			config = "{}"
+		}
+		if _, e = tx.ExecContext(ctx, "INSERT INTO acceptance_criteria(id,task_id,node_id,type,description,required,config,status,reason,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+			c.ID, c.TaskID, c.NodeID, string(c.Type), c.Description, required, config, c.Status, c.Reason, now()); e != nil {
+			return e
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) AcceptanceCriteria(ctx context.Context, tid string) ([]domain.AcceptanceCriterion, error) {
+	rows, e := s.db.QueryContext(ctx, "SELECT id,task_id,COALESCE(node_id,''),type,description,required,config,status,reason FROM acceptance_criteria WHERE task_id=? ORDER BY created_at", tid)
+	if e != nil {
+		return nil, e
+	}
+	defer rows.Close()
+	var out []domain.AcceptanceCriterion
+	for rows.Next() {
+		var c domain.AcceptanceCriterion
+		var typ string
+		var required int
+		var config string
+		if e = rows.Scan(&c.ID, &c.TaskID, &c.NodeID, &typ, &c.Description, &required, &config, &c.Status, &c.Reason); e != nil {
+			return nil, e
+		}
+		c.Type = domain.CriterionType(typ)
+		c.Required = required != 0
+		if config != "" && config != "{}" {
+			c.Config = json.RawMessage(config)
+			var metadata struct {
+				EvidenceIDs []string `json:"evidence_ids"`
+			}
+			if json.Unmarshal([]byte(config), &metadata) == nil {
+				c.EvidenceIDs = metadata.EvidenceIDs
+			}
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) UpdateAcceptanceCriterion(ctx context.Context, id, status, reason string, evidenceIDs []string) error {
+	eids, _ := json.Marshal(evidenceIDs)
+	_, e := s.db.ExecContext(ctx, "UPDATE acceptance_criteria SET status=?,reason=?,config=json_set(config,'$.evidence_ids',json(?)) WHERE id=?", status, reason, string(eids), id)
+	return e
+}
+
+// ---- Graph Revisions (P2) ----
+
+func (s *Store) NextGraphRevision(ctx context.Context, tid string) (int, error) {
+	var v int
+	e := s.db.QueryRowContext(ctx, "SELECT COALESCE(MAX(version),0) FROM graph_revisions WHERE task_id=?", tid).Scan(&v)
+	return v + 1, e
+}
+
+func (s *Store) SaveGraphRevision(ctx context.Context, rev domain.GraphRevision) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err = insertGraphRevisionTx(ctx, tx, rev); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func insertGraphRevisionTx(ctx context.Context, tx *sql.Tx, rev domain.GraphRevision) error {
+	if rev.ID == "" {
+		rev.ID = id("gr")
+	}
+	if rev.CreatedAt.IsZero() {
+		rev.CreatedAt = time.Now().UTC()
+	}
+	_, e := tx.ExecContext(ctx, "INSERT INTO graph_revisions(id,task_id,version,reason,planner_model,source_event,nodes_json,created_at) VALUES(?,?,?,?,?,?,?,?)",
+		rev.ID, rev.TaskID, rev.Version, rev.Reason, rev.PlannerModel, rev.SourceEvent, rev.NodesJSON, rev.CreatedAt.Format(time.RFC3339Nano))
+	return e
+}
+
+func (s *Store) LatestGraphRevision(ctx context.Context, tid string) (domain.GraphRevision, error) {
+	var rev domain.GraphRevision
+	var ts string
+	e := s.db.QueryRowContext(ctx, "SELECT id,task_id,version,reason,planner_model,source_event,nodes_json,created_at FROM graph_revisions WHERE task_id=? ORDER BY version DESC LIMIT 1", tid).Scan(&rev.ID, &rev.TaskID, &rev.Version, &rev.Reason, &rev.PlannerModel, &rev.SourceEvent, &rev.NodesJSON, &ts)
+	if e != nil {
+		return rev, e
+	}
+	rev.CreatedAt, _ = time.Parse(time.RFC3339Nano, ts)
+	return rev, nil
+}
+
+func (s *Store) GraphRevisions(ctx context.Context, tid string) ([]domain.GraphRevision, error) {
+	rows, e := s.db.QueryContext(ctx, "SELECT id,task_id,version,reason,planner_model,source_event,nodes_json,created_at FROM graph_revisions WHERE task_id=? ORDER BY version", tid)
+	if e != nil {
+		return nil, e
+	}
+	defer rows.Close()
+	var out []domain.GraphRevision
+	for rows.Next() {
+		var rev domain.GraphRevision
+		var ts string
+		if e = rows.Scan(&rev.ID, &rev.TaskID, &rev.Version, &rev.Reason, &rev.PlannerModel, &rev.SourceEvent, &rev.NodesJSON, &ts); e != nil {
+			return nil, e
+		}
+		rev.CreatedAt, _ = time.Parse(time.RFC3339Nano, ts)
+		out = append(out, rev)
+	}
+	return out, rows.Err()
 }
 
 func maxInt64(a, b int64) int64 {

@@ -88,6 +88,19 @@ func TestRunToolAndComplete(t *testing.T) {
 			if e != nil || string(b) != "ok" {
 				t.Fatalf("file: %q %v", b, e)
 			}
+			criteria, err := st.AcceptanceCriteria(ctx, task.ID)
+			if err != nil || len(criteria) != 2 {
+				t.Fatalf("criteria=%+v err=%v", criteria, err)
+			}
+			for _, criterion := range criteria {
+				if criterion.ID == "" || criterion.NodeID == "" || criterion.Status != "passed" || len(criterion.EvidenceIDs) == 0 {
+					t.Fatalf("criterion not connected to evidence: %+v", criterion)
+				}
+			}
+			evidence, err := st.EvidenceByTask(ctx, task.ID)
+			if err != nil || len(evidence) != 2 {
+				t.Fatalf("evidence=%+v err=%v", evidence, err)
+			}
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -115,14 +128,16 @@ func TestApprovalPauseAndResume(t *testing.T) {
 	task, _ := svc.Start(ctx, sess.ID, "审批测试")
 	waitStatus := func(want string) {
 		deadline := time.Now().Add(2 * time.Second)
+		var last domain.Task
 		for time.Now().Before(deadline) {
 			got, _ := st.Task(ctx, task.ID)
+			last = got
 			if got.Status == want {
 				return
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
-		t.Fatalf("task did not reach %s", want)
+		t.Fatalf("task did not reach %s: status=%s error=%s", want, last.Status, last.Error)
 	}
 	waitStatus("waiting_approval")
 	as, _ := st.Approvals(ctx, "pending")

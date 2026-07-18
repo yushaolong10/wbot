@@ -274,13 +274,15 @@ func (m *Manager) summarizeMessages(ctx context.Context, sid string, msgs []doma
 	modelName := "deterministic"
 	if m.aux != nil {
 		system := `你负责压缩 Agent 历史。只输出 JSON 对象，字段必须是 objectives,user_constraints,verified_facts,decisions,completed_actions,pending_actions,failed_actions,active_tool_calls,artifacts,memory_ids,file_changes,open_questions，所有字段均为字符串数组。不得把失败写成成功；保留约束、未完成事项、路径和引用 ID；不要推测。`
-		auxCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		out, generateErr := m.aux.Complete(auxCtx, system, string(b))
+		auxCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		out, generateErr := m.aux.Complete(auxCtx, system, compactMessagesText(msgs))
 		cancel()
 		if generateErr == nil {
 			var parsed domain.HistorySummary
 			if decodeSummary(extractJSON(out), &parsed) == nil {
-				summary = parsed
+				// The model may consolidate wording, but it must not silently
+				// remove durable constraints, failures, artifacts, or open work.
+				summary = mergeSummary([]domain.HistorySummary{summary, parsed})
 				modelName = "auxiliary"
 			}
 		}
@@ -342,13 +344,13 @@ func (m *Manager) summarizeSegments(ctx context.Context, sid string, src []domai
 	modelName := "deterministic"
 	if m.aux != nil {
 		system := `合并多个历史摘要。只输出与输入相同字段的 JSON 字符串数组。保留所有未完成事项、用户约束、失败、路径及引用，去重已验证事实；不得推测或宣称未验证成功。`
-		auxCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		out, generateErr := m.aux.Complete(auxCtx, system, string(b))
+		auxCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		out, generateErr := m.aux.Complete(auxCtx, system, compactSegmentsText(src))
 		cancel()
 		if generateErr == nil {
 			var x domain.HistorySummary
 			if decodeSummary(extractJSON(out), &x) == nil {
-				merged = x
+				merged = mergeSummary([]domain.HistorySummary{merged, x})
 				modelName = "auxiliary"
 			}
 		}
@@ -456,6 +458,55 @@ func ToolSnapshotFor(toolName string, result domain.ToolResult, maxRunes int) do
 		result.Summary = "工具结果已压缩"
 	}
 	return result
+}
+
+// compactMessagesText creates a compact text representation of messages for LLM summarization.
+func compactMessagesText(msgs []domain.Message) string {
+	var b strings.Builder
+	for _, m := range msgs {
+		content := Snip(m.Content, 300)
+		switch m.Role {
+		case "user":
+			fmt.Fprintf(&b, "[user] %s\n", content)
+		case "assistant":
+			if len(m.ContentJSON) > 0 {
+				var calls []domain.ToolCall
+				if json.Unmarshal(m.ContentJSON, &calls) == nil {
+					items := make([]string, len(calls))
+					for i, c := range calls {
+						arguments, _ := json.Marshal(c.Arguments)
+						items[i] = fmt.Sprintf("%s(%s)", c.Name, Snip(string(arguments), 400))
+					}
+					fmt.Fprintf(&b, "[assistant] %s | calls: %s\n", Snip(m.Content, 200), strings.Join(items, ", "))
+					continue
+				}
+			}
+			fmt.Fprintf(&b, "[assistant] %s\n", content)
+		case "tool":
+			var result domain.ToolResult
+			if json.Unmarshal(m.ContentJSON, &result) == nil {
+				status := result.Status
+				summary := Snip(result.Summary, 200)
+				fmt.Fprintf(&b, "[tool] %s status=%s artifacts=%v %s\n", m.ToolName, status, result.Artifacts, summary)
+			} else {
+				fmt.Fprintf(&b, "[tool] %s %s\n", m.ToolName, content)
+			}
+		}
+	}
+	return b.String()
+}
+
+// compactSegmentsText creates a compact text representation of existing summary segments.
+func compactSegmentsText(segs []domain.HistorySegment) string {
+	var b strings.Builder
+	for i, s := range segs {
+		var sum domain.HistorySummary
+		if json.Unmarshal([]byte(s.SummaryJSON), &sum) == nil {
+			encoded, _ := json.Marshal(sum)
+			fmt.Fprintf(&b, "[seg%d] %s\n", i+1, encoded)
+		}
+	}
+	return b.String()
 }
 
 func deterministicSummary(msgs []domain.Message) domain.HistorySummary {

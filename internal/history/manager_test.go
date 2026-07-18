@@ -2,6 +2,8 @@ package history
 
 import (
 	"context"
+	"encoding/json"
+	"github.com/wbot-dev/wbot/internal/domain"
 	"github.com/wbot-dev/wbot/internal/storage"
 	"path/filepath"
 	"strings"
@@ -29,5 +31,21 @@ func TestCompactionPersistsSummary(t *testing.T) {
 	summary2, _, _ := m.Select(ctx, s.ID)
 	if summary2 != summary {
 		t.Fatal("same range was summarized twice")
+	}
+}
+
+func TestCompactSegmentsRetainsEverySummaryField(t *testing.T) {
+	summary := domain.HistorySummary{
+		Objectives: []string{"objective"}, UserConstraints: []string{"constraint"}, VerifiedFacts: []string{"fact"},
+		Decisions: []string{"decision"}, CompletedActions: []string{"completed"}, PendingActions: []string{"pending"},
+		FailedActions: []string{"failed"}, ActiveToolCalls: []string{"call"}, Artifacts: []string{"artifact"},
+		MemoryIDs: []string{"memory"}, FileChanges: []string{"file"}, OpenQuestions: []string{"question"},
+	}
+	raw, _ := json.Marshal(summary)
+	compact := compactSegmentsText([]domain.HistorySegment{{SummaryJSON: string(raw)}})
+	for _, value := range []string{"constraint", "fact", "call", "artifact", "memory", "file", "question"} {
+		if !strings.Contains(compact, value) {
+			t.Fatalf("compact summary dropped %q: %s", value, compact)
+		}
 	}
 }
