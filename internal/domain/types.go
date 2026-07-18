@@ -1,6 +1,9 @@
 package domain
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 type Workspace struct {
 	ID, Name, Root, Kind string
@@ -11,8 +14,38 @@ type Session struct {
 	CreatedAt              time.Time
 }
 type Message struct {
-	ID, SessionID, TaskID, Role, Content string
-	CreatedAt                            time.Time
+	ID, SessionID, TaskID, Role, Content  string
+	Seq                                   int64
+	ContentJSON                           json.RawMessage
+	TokenCount                            int
+	ContentHash, CompactionState          string
+	ParentMessageID, ToolCallID, ToolName string
+	ArtifactIDs                           []string
+	Importance                            float64
+	CreatedAt                             time.Time
+}
+
+type HistorySummary struct {
+	Objectives       []string `json:"objectives"`
+	UserConstraints  []string `json:"user_constraints"`
+	VerifiedFacts    []string `json:"verified_facts"`
+	Decisions        []string `json:"decisions"`
+	CompletedActions []string `json:"completed_actions"`
+	PendingActions   []string `json:"pending_actions"`
+	FailedActions    []string `json:"failed_actions"`
+	ActiveToolCalls  []string `json:"active_tool_calls"`
+	Artifacts        []string `json:"artifacts"`
+	MemoryIDs        []string `json:"memory_ids"`
+	FileChanges      []string `json:"file_changes"`
+	OpenQuestions    []string `json:"open_questions"`
+}
+
+type HistorySegment struct {
+	ID, SessionID, TaskID, SummaryJSON, Model, PromptVersion, SourceHash, Status string
+	Level, SourceMessageCount, TokenCount                                        int
+	FirstSeq, LastSeq                                                            int64
+	SourceMessageIDs, SourceSegmentIDs                                           []string
+	CreatedAt                                                                    time.Time
 }
 type Task struct {
 	ID, SessionID, Objective, Status, Result, Error string

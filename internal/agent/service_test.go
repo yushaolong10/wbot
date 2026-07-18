@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"github.com/wbot-dev/wbot/internal/config"
 	"github.com/wbot-dev/wbot/internal/domain"
@@ -12,6 +13,7 @@ import (
 	"github.com/wbot-dev/wbot/internal/tool"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -24,6 +26,17 @@ type fakeModel struct {
 type approvalModel struct {
 	mu sync.Mutex
 	n  int
+}
+type overflowModel struct {
+	mu sync.Mutex
+	n  int
+}
+
+func (f *overflowModel) Generate(context.Context, []model.Message, []tool.Definition) (model.Response, error) {
+	f.mu.Lock()
+	f.n++
+	f.mu.Unlock()
+	return model.Response{}, fmt.Errorf("maximum token context exceeded")
 }
 
 func (f *approvalModel) Generate(_ context.Context, _ []model.Message, _ []tool.Definition) (model.Response, error) {
@@ -85,7 +98,7 @@ func TestApprovalPauseAndResume(t *testing.T) {
 	root := t.TempDir()
 	profile := filepath.Join(root, "profile.yaml")
 	os.WriteFile(profile, []byte("version: 1\nidentity:\n  name: wbot\n  role: test\n  language: zh-CN\npersonality:\n  tone: direct\n"), 0600)
-	s := config.Settings{DataRoot: root, DatabasePath: filepath.Join(root, "w.db"), WorkspaceRoot: root, PermissionMode: "approval", AllowShell: true, ProfilePath: profile, MaxParallelism: 2, MaxContextTokens: 4000}
+	s := config.Settings{DataRoot: root, DatabasePath: filepath.Join(root, "w.db"), WorkspaceRoot: root, PermissionMode: "approval", AllowShell: true, ProfilePath: profile, MaxParallelism: 2, MaxContextTokens: 8000, Context: config.ContextSettings{OutputReserveTokens: 1000, SafetyMarginTokens: 500}}
 	st, e := storage.Open(s.DatabasePath, root)
 	if e != nil {
 		t.Fatal(e)
@@ -121,5 +134,72 @@ func TestApprovalPauseAndResume(t *testing.T) {
 	waitStatus("completed")
 	if b, e := os.ReadFile(filepath.Join(root, "approved.txt")); e != nil || string(b) != "approved" {
 		t.Fatalf("side effect missing: %q %v", b, e)
+	}
+}
+
+func TestSecondContextOverflowReturnsBudgetError(t *testing.T) {
+	root := t.TempDir()
+	profile := filepath.Join(root, "profile.yaml")
+	_ = os.WriteFile(profile, []byte("version: 1\nidentity:\n  name: wbot\n  role: test\n  language: zh-CN\npersonality:\n  tone: direct\n"), 0600)
+	s := config.Settings{DataRoot: root, DatabasePath: filepath.Join(root, "w.db"), WorkspaceRoot: root, PermissionMode: "full_access", AllowShell: true, ProfilePath: profile, MaxParallelism: 1, MaxContextTokens: 8000, Context: config.ContextSettings{OutputReserveTokens: 1000, SafetyMarginTokens: 500}, History: config.HistorySettings{RecentMessages: 20, ReactiveRecentMessages: 6}, Memory: config.MemorySettings{Enabled: false}}
+	st, err := storage.Open(s.DatabasePath, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	mem := memory.New(filepath.Join(root, "memory"), memory.WithConfig(memory.ConfigFrom(s.Memory)))
+	defer mem.Close()
+	fm := &overflowModel{}
+	svc := New(s, st, fm, tool.New(s, st, permission.New(s, st), mem, nil), mem)
+	ctx := context.Background()
+	w, _ := st.OpenWorkspace(ctx, "x", root, "local")
+	sess, _ := st.CreateSession(ctx, w.ID, "x")
+	task, _ := svc.Start(ctx, sess.ID, "overflow")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		got, _ := st.Task(ctx, task.ID)
+		if got.Status == "failed" {
+			if !strings.Contains(got.Error, "context budget exceeded after reactive retry") {
+				t.Fatalf("error=%s", got.Error)
+			}
+			fm.mu.Lock()
+			calls := fm.n
+			fm.mu.Unlock()
+			if calls != 2 {
+				t.Fatalf("calls=%d", calls)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("task did not fail")
+}
+
+func TestInterruptedToolGroupGetsUnknownResult(t *testing.T) {
+	root := t.TempDir()
+	s := config.Settings{WorkspaceRoot: root, PermissionMode: "full_access", Memory: config.MemorySettings{Enabled: false}}
+	st, err := storage.Open(filepath.Join(root, "w.db"), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	mem := memory.New(filepath.Join(root, "memory"), memory.WithConfig(memory.ConfigFrom(s.Memory)))
+	defer mem.Close()
+	svc := New(s, st, &fakeModel{}, tool.New(s, st, permission.New(s, st), mem, nil), mem)
+	ctx := context.Background()
+	w, _ := st.OpenWorkspace(ctx, "x", root, "local")
+	sess, _ := st.CreateSession(ctx, w.ID, "x")
+	task, _ := st.CreateTask(ctx, sess.ID, "recover")
+	calls := []domain.ToolCall{{ID: "a", Name: "filesystem.read", Arguments: map[string]any{"path": "a"}}, {ID: "b", Name: "filesystem.read", Arguments: map[string]any{"path": "b"}}}
+	rawCalls, _ := json.Marshal(calls)
+	_, _ = st.AddStructuredMessage(ctx, domain.Message{SessionID: sess.ID, TaskID: task.ID, Role: "assistant", ContentJSON: rawCalls})
+	first, _ := json.Marshal(domain.ToolResult{ToolCallID: "a", Status: "success"})
+	_, _ = st.AddStructuredMessage(ctx, domain.Message{SessionID: sess.ID, TaskID: task.ID, Role: "tool", ToolCallID: "a", ContentJSON: first})
+	if err = svc.closeInterruptedToolGroup(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := st.Messages(ctx, sess.ID, 10)
+	if len(msgs) != 3 || msgs[2].ToolCallID != "b" || !strings.Contains(string(msgs[2].ContentJSON), "RESULT_UNKNOWN") {
+		t.Fatalf("messages=%+v", msgs)
 	}
 }

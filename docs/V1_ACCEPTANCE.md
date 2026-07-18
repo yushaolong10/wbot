@@ -7,8 +7,8 @@
 | Profile 热更新与版本记录 | 每轮加载 Profile，写入 `prompt.built` 版本、hash 和 Token 事件 | `internal/config/settings_test.go` |
 | 默认低成本模型 | Runtime 只持有默认 Generator；Advisor 仅作为工具 | Agent 集成测试 |
 | Advisor 与调用上限 | `consult_advisor`、任务级预算和独立模型 | `internal/tool/registry_test.go` |
-| 长期记忆 CRUD | YAML 索引、分类 Markdown、版本、软删除、敏感信息阻断 | `internal/memory/manager_test.go` |
-| 上下文预算和 Artifact | History Summary、Reactive compaction、大文件 Artifact | `internal/history/manager_test.go` |
+| 长期记忆 CRUD 与检索 | SQLite/FTS5、模型提取与合并、版本、软删除、作用域、Token Budget、敏感信息阻断 | `internal/memory/manager_test.go`、`internal/memory/retrieval_test.go` |
+| 上下文预算和 Artifact | 结构化 Message、分段层级 Summary、Tool Snapshot、Reactive compaction、大文件 Artifact、最终 Token 门禁 | `internal/history/manager_test.go`、`internal/history/hierarchy_test.go`、`internal/contextbuilder/builder_test.go` |
 | 任务 DAG | 四节点 DAG、依赖校验、确定性状态转换 | `internal/task/graph_test.go` |
 | 有界并发和资源锁 | Scheduler semaphore 与按资源互斥锁 | `internal/task/graph_test.go` |
 | 重启恢复 | Checkpoint、运行任务恢复、工具不确定结果保护 | Agent、Storage、Tool 测试 |

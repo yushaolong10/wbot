@@ -27,12 +27,13 @@ func main() {
 		log.Fatal(e)
 	}
 	defer st.Close()
-	mem := memory.New(s.DataRoot + "/memory")
 	mainModel := model.New(s.DefaultModel)
 	advisor := model.New(s.AdvisorModel)
+	mem := memory.New(s.DataRoot+"/memory", memory.WithConfig(memory.ConfigFrom(s.Memory)), memory.WithGenerator(advisor))
+	defer mem.Close()
 	perm := permission.New(s, st)
 	tools := tool.New(s, st, perm, mem, advisor)
-	svc := agent.New(s, st, mainModel, tools, mem)
+	svc := agent.New(s, st, mainModel, tools, mem, advisor)
 	if e = svc.Recover(context.Background()); e != nil {
 		log.Fatal(e)
 	}

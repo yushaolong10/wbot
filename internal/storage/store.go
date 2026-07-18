@@ -17,6 +17,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/wbot-dev/wbot/internal/domain"
+	"github.com/wbot-dev/wbot/internal/tokenizer"
 	_ "modernc.org/sqlite"
 )
 
@@ -46,22 +47,28 @@ func (s *Store) migrate() error {
 	CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS workspaces(id TEXT PRIMARY KEY,name TEXT NOT NULL,type TEXT NOT NULL DEFAULT 'local',path TEXT NOT NULL DEFAULT '',root TEXT NOT NULL,kind TEXT NOT NULL,created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY,workspace_id TEXT NOT NULL,title TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'active',created_at TEXT NOT NULL,updated_at TEXT NOT NULL,FOREIGN KEY(workspace_id) REFERENCES workspaces(id));
-CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,task_id TEXT,role TEXT NOT NULL,content TEXT NOT NULL,metadata TEXT,created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,task_id TEXT,seq INTEGER NOT NULL,role TEXT NOT NULL,content TEXT NOT NULL DEFAULT '',content_json TEXT,token_count INTEGER NOT NULL DEFAULT 0,content_hash TEXT NOT NULL,compaction_state TEXT NOT NULL DEFAULT 'raw',parent_message_id TEXT,tool_call_id TEXT,tool_name TEXT,artifact_ids TEXT NOT NULL DEFAULT '[]',importance REAL NOT NULL DEFAULT 0.5,created_at TEXT NOT NULL,UNIQUE(session_id,seq));
 CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,objective TEXT NOT NULL,status TEXT NOT NULL,result TEXT NOT NULL DEFAULT '',error TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,updated_at TEXT NOT NULL,completed_at TEXT);
 CREATE TABLE IF NOT EXISTS task_nodes(id TEXT PRIMARY KEY,task_id TEXT NOT NULL,title TEXT NOT NULL,description TEXT NOT NULL,status TEXT NOT NULL,depends_on TEXT NOT NULL,risk_level TEXT NOT NULL,attempt INTEGER NOT NULL,max_attempts INTEGER NOT NULL,result TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS task_checkpoints(id INTEGER PRIMARY KEY AUTOINCREMENT,task_id TEXT NOT NULL,state TEXT NOT NULL,created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS task_criteria(task_id TEXT NOT NULL,criterion TEXT NOT NULL,passed INTEGER NOT NULL DEFAULT 0,reason TEXT NOT NULL DEFAULT '',PRIMARY KEY(task_id,criterion));
 CREATE TABLE IF NOT EXISTS message_summaries(id INTEGER PRIMARY KEY AUTOINCREMENT,session_id TEXT NOT NULL,first_message_id TEXT,last_message_id TEXT,summary TEXT NOT NULL,created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS history_segments(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,task_id TEXT,level INTEGER NOT NULL,first_seq INTEGER NOT NULL,last_seq INTEGER NOT NULL,source_message_ids TEXT NOT NULL DEFAULT '[]',source_segment_ids TEXT NOT NULL DEFAULT '[]',source_message_count INTEGER NOT NULL,summary_json TEXT NOT NULL,token_count INTEGER NOT NULL,model TEXT NOT NULL,prompt_version TEXT NOT NULL,source_hash TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'active',created_at TEXT NOT NULL,UNIQUE(session_id,level,source_hash));
+CREATE TABLE IF NOT EXISTS maintenance_jobs(id TEXT PRIMARY KEY,kind TEXT NOT NULL,dedup_key TEXT NOT NULL,payload TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',attempts INTEGER NOT NULL DEFAULT 0,next_run_at TEXT NOT NULL,lease_until TEXT,last_error TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,updated_at TEXT NOT NULL,UNIQUE(kind,dedup_key));
 CREATE TABLE IF NOT EXISTS approvals(id TEXT PRIMARY KEY,task_id TEXT NOT NULL,session_id TEXT NOT NULL DEFAULT '',node_id TEXT,tool_name TEXT NOT NULL,tool_call_id TEXT NOT NULL DEFAULT '',arguments TEXT NOT NULL,arguments_digest TEXT NOT NULL,risk_level TEXT NOT NULL,reason TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,decided_at TEXT);
 CREATE TABLE IF NOT EXISTS tool_calls(id TEXT PRIMARY KEY,task_id TEXT NOT NULL,node_id TEXT,name TEXT NOT NULL,arguments_digest TEXT NOT NULL,status TEXT NOT NULL,result TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS artifacts(id TEXT PRIMARY KEY,task_id TEXT,kind TEXT NOT NULL DEFAULT '',mime_type TEXT NOT NULL,path TEXT NOT NULL,size INTEGER NOT NULL,sha256 TEXT NOT NULL,created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT,trace_id TEXT NOT NULL DEFAULT '',session_id TEXT NOT NULL,task_id TEXT,node_id TEXT NOT NULL DEFAULT '',type TEXT NOT NULL,payload TEXT NOT NULL,created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS model_usage(id INTEGER PRIMARY KEY AUTOINCREMENT,task_id TEXT NOT NULL,model TEXT NOT NULL,role TEXT NOT NULL,input_tokens INTEGER NOT NULL DEFAULT 0,output_tokens INTEGER NOT NULL DEFAULT 0,total_tokens INTEGER NOT NULL DEFAULT 0,prompt_tokens INTEGER NOT NULL DEFAULT 0,completion_tokens INTEGER NOT NULL DEFAULT 0,duration_ms INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL);
-	CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id,id); CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);`)
+	CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id,id); CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status); CREATE INDEX IF NOT EXISTS idx_history_segments_active ON history_segments(session_id,level,status,first_seq); CREATE INDEX IF NOT EXISTS idx_maintenance_jobs_ready ON maintenance_jobs(status,next_run_at);`)
 	if err != nil {
 		return err
 	}
-	return s.migrateLegacy()
+	if err = s.migrateLegacy(); err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_messages_session_seq ON messages(session_id,seq); CREATE INDEX IF NOT EXISTS idx_messages_task_seq ON messages(task_id,seq);`)
+	return err
 }
 
 type columnMigration struct{ table, column, definition string }
@@ -71,7 +78,7 @@ func (s *Store) migrateLegacy() error {
 		{"workspaces", "name", "TEXT NOT NULL DEFAULT ''"}, {"workspaces", "type", "TEXT NOT NULL DEFAULT 'local'"}, {"workspaces", "path", "TEXT NOT NULL DEFAULT ''"}, {"workspaces", "root", "TEXT NOT NULL DEFAULT ''"}, {"workspaces", "kind", "TEXT NOT NULL DEFAULT 'local'"}, {"workspaces", "created_at", "TEXT NOT NULL DEFAULT ''"},
 		{"sessions", "workspace_id", "TEXT NOT NULL DEFAULT ''"}, {"sessions", "title", "TEXT NOT NULL DEFAULT ''"}, {"sessions", "created_at", "TEXT NOT NULL DEFAULT ''"},
 		{"sessions", "status", "TEXT NOT NULL DEFAULT 'active'"}, {"sessions", "updated_at", "TEXT NOT NULL DEFAULT ''"},
-		{"messages", "task_id", "TEXT"}, {"messages", "metadata", "TEXT"},
+		{"messages", "task_id", "TEXT"}, {"messages", "metadata", "TEXT"}, {"messages", "seq", "INTEGER NOT NULL DEFAULT 0"}, {"messages", "content_json", "TEXT"}, {"messages", "token_count", "INTEGER NOT NULL DEFAULT 0"}, {"messages", "content_hash", "TEXT NOT NULL DEFAULT ''"}, {"messages", "compaction_state", "TEXT NOT NULL DEFAULT 'raw'"}, {"messages", "parent_message_id", "TEXT"}, {"messages", "tool_call_id", "TEXT"}, {"messages", "tool_name", "TEXT"}, {"messages", "artifact_ids", "TEXT NOT NULL DEFAULT '[]'"}, {"messages", "importance", "REAL NOT NULL DEFAULT 0.5"},
 		{"tasks", "result", "TEXT NOT NULL DEFAULT ''"}, {"tasks", "error", "TEXT NOT NULL DEFAULT ''"}, {"tasks", "updated_at", "TEXT NOT NULL DEFAULT ''"}, {"tasks", "completed_at", "TEXT"},
 		{"task_nodes", "description", "TEXT NOT NULL DEFAULT ''"}, {"task_nodes", "depends_on", "TEXT NOT NULL DEFAULT '[]'"}, {"task_nodes", "risk_level", "TEXT NOT NULL DEFAULT 'low'"}, {"task_nodes", "attempt", "INTEGER NOT NULL DEFAULT 0"}, {"task_nodes", "max_attempts", "INTEGER NOT NULL DEFAULT 2"}, {"task_nodes", "result", "TEXT NOT NULL DEFAULT ''"}, {"task_nodes", "created_at", "TEXT NOT NULL DEFAULT ''"}, {"task_nodes", "updated_at", "TEXT NOT NULL DEFAULT ''"},
 		{"approvals", "session_id", "TEXT NOT NULL DEFAULT ''"}, {"approvals", "node_id", "TEXT"}, {"approvals", "tool_call_id", "TEXT NOT NULL DEFAULT ''"}, {"approvals", "arguments_digest", "TEXT NOT NULL DEFAULT ''"}, {"approvals", "risk_level", "TEXT NOT NULL DEFAULT 'L2'"}, {"approvals", "reason", "TEXT NOT NULL DEFAULT ''"}, {"approvals", "decided_at", "TEXT"},
@@ -168,43 +175,143 @@ func (s *Store) Session(ctx context.Context, sid string) (domain.Session, error)
 	return x, e
 }
 func (s *Store) AddMessage(ctx context.Context, sid, tid, role, content string) (domain.Message, error) {
-	m := domain.Message{ID: id("msg"), SessionID: sid, TaskID: tid, Role: role, Content: content, CreatedAt: time.Now().UTC()}
-	_, e := s.db.ExecContext(ctx, "INSERT INTO messages(id,session_id,task_id,role,content,created_at) VALUES(?,?,?,?,?,?)", m.ID, sid, tid, role, content, m.CreatedAt.Format(time.RFC3339Nano))
+	return s.AddStructuredMessage(ctx, domain.Message{SessionID: sid, TaskID: tid, Role: role, Content: content, Importance: .5})
+}
+
+func (s *Store) AddStructuredMessage(ctx context.Context, m domain.Message) (domain.Message, error) {
+	if m.ID == "" {
+		m.ID = id("msg")
+	}
+	if m.CompactionState == "" {
+		m.CompactionState = "raw"
+	}
+	if m.Importance == 0 {
+		m.Importance = .5
+	}
+	if m.CreatedAt.IsZero() {
+		m.CreatedAt = time.Now().UTC()
+	}
+	h := sha256.Sum256(append([]byte(m.Content), m.ContentJSON...))
+	m.ContentHash = hex.EncodeToString(h[:])
+	if m.TokenCount == 0 {
+		c := tokenizer.Counter{}
+		m.TokenCount = c.CountString(m.Content) + c.CountJSON(m.ContentJSON)
+	}
+	artifacts, _ := json.Marshal(m.ArtifactIDs)
+	tx, e := s.db.BeginTx(ctx, nil)
+	if e != nil {
+		return m, e
+	}
+	defer tx.Rollback()
+	if e = tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(seq),0)+1 FROM messages WHERE session_id=?", m.SessionID).Scan(&m.Seq); e != nil {
+		return m, e
+	}
+	_, e = tx.ExecContext(ctx, "INSERT INTO messages(id,session_id,task_id,seq,role,content,content_json,token_count,content_hash,compaction_state,parent_message_id,tool_call_id,tool_name,artifact_ids,importance,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", m.ID, m.SessionID, m.TaskID, m.Seq, m.Role, m.Content, nullableJSON(m.ContentJSON), m.TokenCount, m.ContentHash, m.CompactionState, nullable(m.ParentMessageID), nullable(m.ToolCallID), nullable(m.ToolName), string(artifacts), m.Importance, m.CreatedAt.Format(time.RFC3339Nano))
+	if e == nil {
+		e = tx.Commit()
+	}
 	return m, e
 }
+
+func nullable(v string) any {
+	if v == "" {
+		return nil
+	}
+	return v
+}
+func nullableJSON(v json.RawMessage) any {
+	if len(v) == 0 {
+		return nil
+	}
+	return string(v)
+}
+
+func scanMessage(rows interface{ Scan(...any) error }) (domain.Message, error) {
+	var m domain.Message
+	var contentJSON, parent, callID, toolName sql.NullString
+	var artifacts, ts string
+	e := rows.Scan(&m.ID, &m.SessionID, &m.TaskID, &m.Seq, &m.Role, &m.Content, &contentJSON, &m.TokenCount, &m.ContentHash, &m.CompactionState, &parent, &callID, &toolName, &artifacts, &m.Importance, &ts)
+	if e != nil {
+		return m, e
+	}
+	if contentJSON.Valid {
+		m.ContentJSON = json.RawMessage(contentJSON.String)
+	}
+	m.ParentMessageID, m.ToolCallID, m.ToolName = parent.String, callID.String, toolName.String
+	_ = json.Unmarshal([]byte(artifacts), &m.ArtifactIDs)
+	m.CreatedAt, _ = time.Parse(time.RFC3339Nano, ts)
+	return m, nil
+}
+
+const messageColumns = "id,session_id,COALESCE(task_id,''),seq,role,content,content_json,token_count,content_hash,compaction_state,parent_message_id,tool_call_id,tool_name,artifact_ids,importance,created_at"
+
 func (s *Store) Messages(ctx context.Context, sid string, limit int) ([]domain.Message, error) {
-	rows, e := s.db.QueryContext(ctx, "SELECT id,session_id,COALESCE(task_id,''),role,content,created_at FROM (SELECT * FROM messages WHERE session_id=? ORDER BY created_at DESC LIMIT ?) ORDER BY created_at", sid, limit)
+	rows, e := s.db.QueryContext(ctx, "SELECT "+messageColumns+" FROM (SELECT * FROM messages WHERE session_id=? ORDER BY seq DESC LIMIT ?) ORDER BY seq", sid, limit)
 	if e != nil {
 		return nil, e
 	}
 	defer rows.Close()
 	out := make([]domain.Message, 0)
 	for rows.Next() {
-		var m domain.Message
-		var t string
-		rows.Scan(&m.ID, &m.SessionID, &m.TaskID, &m.Role, &m.Content, &t)
-		m.CreatedAt, _ = time.Parse(time.RFC3339Nano, t)
+		m, x := scanMessage(rows)
+		if x != nil {
+			return nil, x
+		}
 		out = append(out, m)
 	}
 	return out, rows.Err()
 }
 func (s *Store) TaskMessages(ctx context.Context, tid string, limit int) ([]domain.Message, error) {
-	rows, e := s.db.QueryContext(ctx, "SELECT id,session_id,COALESCE(task_id,''),role,content,created_at FROM (SELECT * FROM messages WHERE task_id=? ORDER BY created_at DESC LIMIT ?) ORDER BY created_at", tid, limit)
+	rows, e := s.db.QueryContext(ctx, "SELECT "+messageColumns+" FROM (SELECT * FROM messages WHERE task_id=? ORDER BY seq DESC LIMIT ?) ORDER BY seq", tid, limit)
 	if e != nil {
 		return nil, e
 	}
 	defer rows.Close()
 	out := make([]domain.Message, 0)
 	for rows.Next() {
-		var m domain.Message
-		var ts string
-		if e = rows.Scan(&m.ID, &m.SessionID, &m.TaskID, &m.Role, &m.Content, &ts); e != nil {
-			return nil, e
+		m, x := scanMessage(rows)
+		if x != nil {
+			return nil, x
 		}
-		m.CreatedAt, _ = time.Parse(time.RFC3339Nano, ts)
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) MessagesRange(ctx context.Context, sid string, afterSeq, throughSeq int64, limit int) ([]domain.Message, error) {
+	q := "SELECT " + messageColumns + " FROM messages WHERE session_id=? AND seq>?"
+	args := []any{sid, afterSeq}
+	if throughSeq > 0 {
+		q += " AND seq<=?"
+		args = append(args, throughSeq)
+	}
+	q += " ORDER BY seq LIMIT ?"
+	args = append(args, limit)
+	rows, e := s.db.QueryContext(ctx, q, args...)
+	if e != nil {
+		return nil, e
+	}
+	defer rows.Close()
+	var out []domain.Message
+	for rows.Next() {
+		m, x := scanMessage(rows)
+		if x != nil {
+			return nil, x
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) MaxMessageSeq(ctx context.Context, sid string) (int64, error) {
+	var n int64
+	e := s.db.QueryRowContext(ctx, "SELECT COALESCE(MAX(seq),0) FROM messages WHERE session_id=?", sid).Scan(&n)
+	return n, e
+}
+
+func (s *Store) SetMessagesCompactionState(ctx context.Context, sid string, first, last int64, state string) error {
+	_, e := s.db.ExecContext(ctx, "UPDATE messages SET compaction_state=? WHERE session_id=? AND seq BETWEEN ? AND ?", state, sid, first, last)
+	return e
 }
 func (s *Store) LatestSummary(ctx context.Context, sid string) (string, string, error) {
 	var last, summary string
@@ -217,6 +324,164 @@ func (s *Store) LatestSummary(ctx context.Context, sid string) (string, string, 
 func (s *Store) SaveSummary(ctx context.Context, sid, first, last, summary string) error {
 	_, e := s.db.ExecContext(ctx, "INSERT INTO message_summaries(session_id,first_message_id,last_message_id,summary,created_at) VALUES(?,?,?,?,?)", sid, first, last, summary, now())
 	return e
+}
+
+func (s *Store) SaveHistorySegment(ctx context.Context, seg domain.HistorySegment) error {
+	if seg.ID == "" {
+		seg.ID = id("segment")
+	}
+	if seg.Status == "" {
+		seg.Status = "active"
+	}
+	if seg.CreatedAt.IsZero() {
+		seg.CreatedAt = time.Now().UTC()
+	}
+	mids, _ := json.Marshal(seg.SourceMessageIDs)
+	sids, _ := json.Marshal(seg.SourceSegmentIDs)
+	_, e := s.db.ExecContext(ctx, `INSERT INTO history_segments(id,session_id,task_id,level,first_seq,last_seq,source_message_ids,source_segment_ids,source_message_count,summary_json,token_count,model,prompt_version,source_hash,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, seg.ID, seg.SessionID, nullable(seg.TaskID), seg.Level, seg.FirstSeq, seg.LastSeq, string(mids), string(sids), seg.SourceMessageCount, seg.SummaryJSON, seg.TokenCount, seg.Model, seg.PromptVersion, seg.SourceHash, seg.Status, seg.CreatedAt.Format(time.RFC3339Nano))
+	return e
+}
+
+func scanSegment(rows interface{ Scan(...any) error }) (domain.HistorySegment, error) {
+	var x domain.HistorySegment
+	var tid sql.NullString
+	var mids, sids, ts string
+	e := rows.Scan(&x.ID, &x.SessionID, &tid, &x.Level, &x.FirstSeq, &x.LastSeq, &mids, &sids, &x.SourceMessageCount, &x.SummaryJSON, &x.TokenCount, &x.Model, &x.PromptVersion, &x.SourceHash, &x.Status, &ts)
+	if e != nil {
+		return x, e
+	}
+	x.TaskID = tid.String
+	_ = json.Unmarshal([]byte(mids), &x.SourceMessageIDs)
+	_ = json.Unmarshal([]byte(sids), &x.SourceSegmentIDs)
+	x.CreatedAt, _ = time.Parse(time.RFC3339Nano, ts)
+	return x, nil
+}
+
+const segmentColumns = "id,session_id,task_id,level,first_seq,last_seq,source_message_ids,source_segment_ids,source_message_count,summary_json,token_count,model,prompt_version,source_hash,status,created_at"
+
+func (s *Store) HistorySegments(ctx context.Context, sid, status string) ([]domain.HistorySegment, error) {
+	q := "SELECT " + segmentColumns + " FROM history_segments WHERE session_id=?"
+	args := []any{sid}
+	if status != "" {
+		q += " AND status=?"
+		args = append(args, status)
+	}
+	q += " ORDER BY first_seq,level"
+	rows, e := s.db.QueryContext(ctx, q, args...)
+	if e != nil {
+		return nil, e
+	}
+	defer rows.Close()
+	var out []domain.HistorySegment
+	for rows.Next() {
+		x, err := scanSegment(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, x)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) CompactHistorySegments(ctx context.Context, sourceIDs []string, merged domain.HistorySegment) error {
+	if merged.ID == "" {
+		merged.ID = id("segment")
+	}
+	if merged.Status == "" {
+		merged.Status = "active"
+	}
+	if merged.CreatedAt.IsZero() {
+		merged.CreatedAt = time.Now().UTC()
+	}
+	mids, _ := json.Marshal(merged.SourceMessageIDs)
+	sids, _ := json.Marshal(merged.SourceSegmentIDs)
+	tx, e := s.db.BeginTx(ctx, nil)
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback()
+	_, e = tx.ExecContext(ctx, `INSERT INTO history_segments(id,session_id,task_id,level,first_seq,last_seq,source_message_ids,source_segment_ids,source_message_count,summary_json,token_count,model,prompt_version,source_hash,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, merged.ID, merged.SessionID, nullable(merged.TaskID), merged.Level, merged.FirstSeq, merged.LastSeq, string(mids), string(sids), merged.SourceMessageCount, merged.SummaryJSON, merged.TokenCount, merged.Model, merged.PromptVersion, merged.SourceHash, merged.Status, merged.CreatedAt.Format(time.RFC3339Nano))
+	if e != nil {
+		return e
+	}
+	for _, sid := range sourceIDs {
+		if _, e = tx.ExecContext(ctx, "UPDATE history_segments SET status='compacted' WHERE id=? AND status='active'", sid); e != nil {
+			return e
+		}
+	}
+	return tx.Commit()
+}
+
+type MaintenanceJob struct {
+	ID, Kind, DedupKey, Payload, Status, LastError string
+	Attempts                                       int
+	NextRunAt, LeaseUntil, CreatedAt, UpdatedAt    time.Time
+}
+
+func (s *Store) EnqueueMaintenance(ctx context.Context, kind, key string, payload any) error {
+	b, _ := json.Marshal(payload)
+	ts := now()
+	_, e := s.db.ExecContext(ctx, `INSERT INTO maintenance_jobs(id,kind,dedup_key,payload,status,attempts,next_run_at,last_error,created_at,updated_at) VALUES(?,?,?,?, 'pending',0,?,'',?,?) ON CONFLICT(kind,dedup_key) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at`, id("job"), kind, key, string(b), ts, ts, ts)
+	return e
+}
+
+func (s *Store) ClaimMaintenance(ctx context.Context, lease time.Duration) (MaintenanceJob, bool, error) {
+	tx, e := s.db.BeginTx(ctx, nil)
+	if e != nil {
+		return MaintenanceJob{}, false, e
+	}
+	defer tx.Rollback()
+	var j MaintenanceJob
+	var next, leaseText sql.NullString
+	var created, updated string
+	e = tx.QueryRowContext(ctx, `SELECT id,kind,dedup_key,payload,status,attempts,next_run_at,lease_until,last_error,created_at,updated_at FROM maintenance_jobs WHERE (status='pending' OR (status='running' AND lease_until<?)) AND next_run_at<=? ORDER BY next_run_at,created_at LIMIT 1`, now(), now()).Scan(&j.ID, &j.Kind, &j.DedupKey, &j.Payload, &j.Status, &j.Attempts, &next, &leaseText, &j.LastError, &created, &updated)
+	if errors.Is(e, sql.ErrNoRows) {
+		return MaintenanceJob{}, false, nil
+	}
+	if e != nil {
+		return j, false, e
+	}
+	until := time.Now().UTC().Add(lease)
+	r, e := tx.ExecContext(ctx, "UPDATE maintenance_jobs SET status='running',attempts=attempts+1,lease_until=?,updated_at=? WHERE id=?", until.Format(time.RFC3339Nano), now(), j.ID)
+	if e != nil {
+		return j, false, e
+	}
+	n, _ := r.RowsAffected()
+	if n != 1 {
+		return MaintenanceJob{}, false, nil
+	}
+	if e = tx.Commit(); e != nil {
+		return j, false, e
+	}
+	j.Attempts++
+	j.LeaseUntil = until
+	j.NextRunAt, _ = time.Parse(time.RFC3339Nano, next.String)
+	j.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+	j.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
+	return j, true, nil
+}
+
+func (s *Store) FinishMaintenance(ctx context.Context, id string, runErr error) error {
+	if runErr == nil {
+		_, e := s.db.ExecContext(ctx, "UPDATE maintenance_jobs SET status='completed',lease_until=NULL,last_error='',updated_at=? WHERE id=?", now(), id)
+		return e
+	}
+	var attempts int
+	_ = s.db.QueryRowContext(ctx, "SELECT attempts FROM maintenance_jobs WHERE id=?", id).Scan(&attempts)
+	delay := time.Duration(1<<minInt(attempts, 8)) * time.Second
+	status := "pending"
+	if attempts >= 8 {
+		status = "failed"
+	}
+	_, e := s.db.ExecContext(ctx, "UPDATE maintenance_jobs SET status=?,lease_until=NULL,last_error=?,next_run_at=?,updated_at=? WHERE id=?", status, runErr.Error(), time.Now().UTC().Add(delay).Format(time.RFC3339Nano), now(), id)
+	return e
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 func (s *Store) CreateTask(ctx context.Context, sid, objective string) (domain.Task, error) {
 	t := domain.Task{ID: id("task"), SessionID: sid, Objective: objective, Status: "running", CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}

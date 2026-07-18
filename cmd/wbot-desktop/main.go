@@ -39,11 +39,12 @@ func main() {
 		log.Fatal(e)
 	}
 	defer st.Close()
-	mem := memory.New(s.DataRoot + "/memory")
 	mainModel := model.New(s.DefaultModel)
 	advisor := model.New(s.AdvisorModel)
+	mem := memory.New(s.DataRoot+"/memory", memory.WithConfig(memory.ConfigFrom(s.Memory)), memory.WithGenerator(advisor))
+	defer mem.Close()
 	tools := tool.New(s, st, permission.New(s, st), mem, advisor)
-	svc := agent.New(s, st, mainModel, tools, mem)
+	svc := agent.New(s, st, mainModel, tools, mem, advisor)
 	_ = svc.Recover(context.Background())
 	api := httpapi.New(s, st, svc, mem)
 	url := "http://" + s.Addr

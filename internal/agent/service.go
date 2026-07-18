@@ -2,16 +2,17 @@ package agent
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/wbot-dev/wbot/internal/config"
+	"github.com/wbot-dev/wbot/internal/contextbuilder"
 	"github.com/wbot-dev/wbot/internal/domain"
 	"github.com/wbot-dev/wbot/internal/history"
+	"github.com/wbot-dev/wbot/internal/inference"
 	"github.com/wbot-dev/wbot/internal/memory"
 	"github.com/wbot-dev/wbot/internal/model"
 	"github.com/wbot-dev/wbot/internal/storage"
@@ -20,18 +21,28 @@ import (
 )
 
 type Service struct {
-	s         config.Settings
-	store     *storage.Store
-	model     model.Generator
-	tools     *tool.Registry
-	memories  *memory.Manager
-	history   *history.Manager
-	scheduler *taskgraph.Scheduler
-	running   sync.Map
+	s               config.Settings
+	store           *storage.Store
+	model           model.Generator
+	tools           *tool.Registry
+	memories        *memory.Manager
+	history         *history.Manager
+	context         *contextbuilder.Builder
+	scheduler       *taskgraph.Scheduler
+	running         sync.Map
+	maintenanceOnce sync.Once
 }
 
-func New(s config.Settings, st *storage.Store, m model.Generator, t *tool.Registry, mem *memory.Manager) *Service {
-	return &Service{s: s, store: st, model: m, tools: t, memories: mem, history: history.New(st, s.MaxContextTokens/4), scheduler: taskgraph.NewScheduler(s.MaxParallelism)}
+func New(s config.Settings, st *storage.Store, m model.Generator, t *tool.Registry, mem *memory.Manager, auxiliary ...inference.TextGenerator) *Service {
+	hc := history.Config{Budget: s.MaxContextTokens / 4, MaxLoaded: s.History.MaxLoadedMessages, Recent: s.History.RecentMessages, RecentMin: s.History.RecentMinMessages, ReactiveRecent: s.History.ReactiveRecentMessages, SegmentMessages: s.History.SegmentMessages, SegmentMaxTokens: s.History.SegmentMaxSourceTokens, MergeFactor: s.History.SegmentMergeFactor, SummaryTarget: s.History.SummaryTargetTokens}
+	opts := []history.Option{history.WithConfig(hc)}
+	if len(auxiliary) > 0 && auxiliary[0] != nil {
+		opts = append(opts, history.WithGenerator(auxiliary[0]))
+	}
+	hm := history.New(st, s.MaxContextTokens/4, opts...)
+	svc := &Service{s: s, store: st, model: m, tools: t, memories: mem, history: hm, scheduler: taskgraph.NewScheduler(s.MaxParallelism)}
+	svc.context = contextbuilder.New(s, st, mem, hm, t.Definitions)
+	return svc
 }
 func (s *Service) Start(ctx context.Context, sessionID, objective string) (domain.Task, error) {
 	if _, e := s.store.Session(ctx, sessionID); e != nil {
@@ -84,7 +95,23 @@ func (s *Service) Recover(ctx context.Context) error {
 			s.RunAsync(id)
 		}
 	}
+	_ = s.store.EnqueueMaintenance(ctx, "memory.maintain", time.Now().UTC().Format("2006-01-02"), map[string]any{})
+	s.startMaintenanceLoop()
 	return nil
+}
+
+func (s *Service) startMaintenanceLoop() {
+	s.maintenanceOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(time.Minute)
+			defer ticker.Stop()
+			for {
+				_ = s.store.EnqueueMaintenance(context.Background(), "memory.maintain", time.Now().UTC().Format("2006-01-02"), map[string]any{})
+				s.drainMaintenance(context.Background())
+				<-ticker.C
+			}
+		}()
+	})
 }
 func (s *Service) Run(ctx context.Context, tid string) error {
 	t, e := s.store.Task(ctx, tid)
@@ -134,25 +161,32 @@ func (s *Service) Run(ctx context.Context, tid string) error {
 	_ = s.store.UpdateNode(ctx, nodeID, "ready", "")
 	_ = s.store.TransitionNode(ctx, nodeID, "ready", "running", "")
 	_ = s.store.SaveCheckpoint(ctx, t.ID, map[string]any{"phase": "model_loop", "node_id": nodeID})
+	if e = s.closeInterruptedToolGroup(ctx, t); e != nil {
+		return s.fail(ctx, t, nodeID, e)
+	}
 	for round := 0; round < 30; round++ {
-		msgs, e := s.buildContext(ctx, t)
+		built, e := s.context.Build(ctx, contextbuilder.Request{SessionID: t.SessionID, TaskID: t.ID, Objective: t.Objective, Mode: contextbuilder.Normal})
 		if e != nil {
 			return s.fail(ctx, t, nodeID, e)
 		}
-		resp, e := s.model.Generate(ctx, msgs, s.tools.Definitions())
-		if e != nil && (strings.Contains(strings.ToLower(e.Error()), "context") || strings.Contains(strings.ToLower(e.Error()), "maximum token")) {
-			summary, recent, x := s.history.Force(ctx, t.SessionID, 6)
-			if x == nil {
-				compact := []model.Message{msgs[0], {Role: "system", Content: summary}}
-				for _, m := range recent {
-					role := m.Role
-					if role == "tool" {
-						role = "user"
-					}
-					compact = append(compact, model.Message{Role: role, Content: m.Content})
+		resp, e := s.model.Generate(ctx, built.Messages, s.tools.Definitions())
+		reactiveRetries := s.s.History.ReactiveRetryCount
+		if reactiveRetries <= 0 {
+			reactiveRetries = 1
+		}
+		if e != nil && reactiveRetries > 0 && (strings.Contains(strings.ToLower(e.Error()), "context") || strings.Contains(strings.ToLower(e.Error()), "maximum token")) {
+			s.store.Emit(ctx, t.SessionID, t.ID, "context.reactive_retry", map[string]any{"normal_breakdown": built.Breakdown})
+			reactive, x := s.context.Build(ctx, contextbuilder.Request{SessionID: t.SessionID, TaskID: t.ID, Objective: t.Objective, Mode: contextbuilder.Reactive})
+			if x != nil {
+				e = x
+			} else {
+				resp, e = s.model.Generate(ctx, reactive.Messages, s.tools.Definitions())
+				if e != nil && (strings.Contains(strings.ToLower(e.Error()), "context") || strings.Contains(strings.ToLower(e.Error()), "maximum token")) {
+					e = fmt.Errorf("%w after reactive retry: breakdown=%+v: %v", contextbuilder.ErrBudgetExceeded, reactive.Breakdown, e)
+					s.store.Emit(ctx, t.SessionID, t.ID, "context.budget_exceeded", map[string]any{"breakdown": reactive.Breakdown, "error": e.Error()})
+				} else {
+					s.store.Emit(ctx, t.SessionID, t.ID, "context.compacted", map[string]any{"mode": "reactive", "breakdown": reactive.Breakdown})
 				}
-				resp, e = s.model.Generate(ctx, compact, s.tools.Definitions())
-				s.store.Emit(ctx, t.SessionID, t.ID, "context.compacted", map[string]any{"mode": "reactive", "messages": len(recent)})
 			}
 		}
 		if e != nil {
@@ -185,19 +219,35 @@ func (s *Service) Run(ctx context.Context, tid string) error {
 			s.store.UpdateTask(ctx, t.ID, "completed", content, "")
 			_ = s.store.SaveCheckpoint(ctx, t.ID, map[string]any{"phase": "completed"})
 			s.store.Emit(ctx, t.SessionID, t.ID, "task.completed", map[string]any{"result": content, "verification": verification})
+			_ = s.store.EnqueueMaintenance(ctx, "memory.extract", t.ID, map[string]any{"task_id": t.ID})
+			go s.drainMaintenance(context.Background())
 			return nil
 		}
-		if resp.Content != "" {
-			s.store.AddMessage(ctx, t.SessionID, t.ID, "assistant", resp.Content)
-		}
-		for _, call := range resp.ToolCalls {
-			b, _ := json.Marshal(call)
-			s.store.AddMessage(ctx, t.SessionID, t.ID, "assistant", "TOOL_CALL "+string(b))
+		callsJSON, _ := json.Marshal(resp.ToolCalls)
+		_, _ = s.store.AddStructuredMessage(ctx, domain.Message{SessionID: t.SessionID, TaskID: t.ID, Role: "assistant", Content: resp.Content, ContentJSON: callsJSON, Importance: .7})
+		for callIndex, call := range resp.ToolCalls {
 			s.store.Emit(ctx, t.SessionID, t.ID, "tool.started", call)
 			result, approval := s.tools.Execute(ctx, t.ID, call)
+			rawResult, _ := json.Marshal(result)
+			if len(rawResult) > 8*1024 {
+				if aid, x := s.store.PutArtifact(ctx, t.ID, "application/json", rawResult); x == nil {
+					result.Artifacts = append(result.Artifacts, aid)
+				}
+			}
+			result = history.ToolSnapshotFor(call.Name, result, s.s.History.ToolSnapshotMaxTokens*3)
+			if len(rawResult) > s.s.History.ToolSnapshotMaxTokens*3 {
+				s.store.Emit(ctx, t.SessionID, t.ID, "tool.snapshot.created", map[string]any{"tool_call_id": call.ID, "tool": call.Name, "original_bytes": len(rawResult), "artifact_ids": result.Artifacts})
+			}
 			rb, _ := json.Marshal(result)
-			s.store.AddMessage(ctx, t.SessionID, t.ID, "tool", string(rb))
+			_, _ = s.store.AddStructuredMessage(ctx, domain.Message{SessionID: t.SessionID, TaskID: t.ID, Role: "tool", Content: result.Summary, ContentJSON: rb, ToolCallID: call.ID, ToolName: call.Name, ArtifactIDs: result.Artifacts, Importance: .8})
 			if approval != nil {
+				// Chat completion APIs require one result for every call in the
+				// assistant's tool_calls array. Mark unstarted siblings explicitly.
+				for _, skipped := range resp.ToolCalls[callIndex+1:] {
+					skippedResult := domain.ToolResult{ToolCallID: skipped.ID, Status: "skipped", Summary: "未执行：同批次工具调用正在等待审批", Retryable: true}
+					raw, _ := json.Marshal(skippedResult)
+					_, _ = s.store.AddStructuredMessage(ctx, domain.Message{SessionID: t.SessionID, TaskID: t.ID, Role: "tool", Content: skippedResult.Summary, ContentJSON: raw, ToolCallID: skipped.ID, ToolName: skipped.Name, Importance: .8})
+				}
 				_ = s.store.UpdateNode(ctx, nodeID, "waiting_approval", "")
 				s.store.UpdateTask(ctx, t.ID, "waiting_approval", "", "")
 				s.store.Emit(ctx, t.SessionID, t.ID, "approval.requested", approval)
@@ -208,6 +258,46 @@ func (s *Service) Run(ctx context.Context, tid string) error {
 		}
 	}
 	return s.fail(ctx, t, nodeID, fmt.Errorf("agent exceeded maximum rounds"))
+}
+
+func (s *Service) closeInterruptedToolGroup(ctx context.Context, task domain.Task) error {
+	msgs, err := s.store.Messages(ctx, task.SessionID, 500)
+	if err != nil || len(msgs) == 0 {
+		return err
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		m := msgs[i]
+		if m.Role != "assistant" || len(m.ContentJSON) == 0 {
+			continue
+		}
+		var calls []domain.ToolCall
+		if json.Unmarshal(m.ContentJSON, &calls) != nil || len(calls) == 0 {
+			continue
+		}
+		seen := map[string]bool{}
+		for j := i + 1; j < len(msgs) && msgs[j].Role == "tool"; j++ {
+			seen[msgs[j].ToolCallID] = true
+		}
+		if len(seen) == len(calls) {
+			return nil
+		}
+		if i+1 < len(msgs) && msgs[len(msgs)-1].Role != "tool" {
+			return fmt.Errorf("interrupted tool group is no longer contiguous")
+		}
+		for _, call := range calls {
+			if seen[call.ID] {
+				continue
+			}
+			result := domain.ToolResult{ToolCallID: call.ID, Status: "unknown", Summary: "进程中断：工具是否已产生外部影响无法确定，必须先检查实际状态", Retryable: false, Error: &domain.ToolError{Code: "RESULT_UNKNOWN", Message: "tool execution was interrupted before a durable result was recorded"}}
+			raw, _ := json.Marshal(result)
+			if _, err = s.store.AddStructuredMessage(ctx, domain.Message{SessionID: task.SessionID, TaskID: task.ID, Role: "tool", Content: result.Summary, ContentJSON: raw, ToolCallID: call.ID, ToolName: call.Name, Importance: 1}); err != nil {
+				return err
+			}
+		}
+		s.store.Emit(ctx, task.SessionID, task.ID, "tool.result_unknown", map[string]any{"assistant_message_id": m.ID})
+		return nil
+	}
+	return nil
 }
 func (s *Service) Resume(ctx context.Context, tid string) {
 	s.store.UpdateTask(ctx, tid, "running", "", "")
@@ -225,49 +315,44 @@ func (s *Service) fail(ctx context.Context, t domain.Task, nid string, e error) 
 	s.store.Emit(ctx, t.SessionID, t.ID, "task.failed", map[string]any{"error": e.Error()})
 	return e
 }
-func (s *Service) buildContext(ctx context.Context, t domain.Task) ([]model.Message, error) {
-	p, b, e := config.LoadProfile(s.s.ProfilePath)
-	if e != nil {
-		return nil, e
-	}
-	h := sha256.Sum256(b)
-	s.store.Emit(ctx, t.SessionID, t.ID, "prompt.built", map[string]any{"profile_version": p.Version, "profile_hash": "sha256:" + hex.EncodeToString(h[:]), "prompt_template_version": "0.1", "estimated_tokens": len(b) / 3})
-	mem, _ := s.memories.Retrieve(ctx, t.Objective, 5)
-	summary, hist, e := s.history.Select(ctx, t.SessionID)
-	if e != nil {
-		return nil, e
-	}
-	system := fmt.Sprintf("你是 %s，角色是%s。语言：%s。风格：%s。\n%s\n必须通过工具获取证据；所有副作用由权限引擎裁决；不得声称未验证的成功。当前工作区：%s。Profile hash: sha256:%s", p.Identity.Name, p.Identity.Role, p.Identity.Language, p.Personality.Tone, p.CustomInstructions, s.s.WorkspaceRoot, hex.EncodeToString(h[:]))
-	if len(mem) > 0 {
-		mb, _ := json.Marshal(mem)
-		system += "\n相关长期记忆：" + string(mb)
-	}
-	out := []model.Message{{Role: "system", Content: system}}
-	if summary != "" {
-		out = append(out, model.Message{Role: "system", Content: summary})
-	}
-	for _, m := range hist {
-		role := m.Role
-		if role == "tool" {
-			var tr domain.ToolResult
-			if json.Unmarshal([]byte(m.Content), &tr) == nil {
-				out = append(out, model.Message{Role: "tool", ToolCallID: tr.ToolCallID, Content: m.Content})
-				continue
-			}
-			role = "user"
-			m.Content = "上一工具结果：" + m.Content
+func (s *Service) drainMaintenance(ctx context.Context) {
+	for i := 0; i < 16; i++ {
+		job, ok, e := s.store.ClaimMaintenance(ctx, 2*time.Minute)
+		if e != nil || !ok {
+			return
 		}
-		if strings.HasPrefix(m.Content, "TOOL_CALL ") {
-			var tc domain.ToolCall
-			if json.Unmarshal([]byte(strings.TrimPrefix(m.Content, "TOOL_CALL ")), &tc) == nil {
-				args, _ := json.Marshal(tc.Arguments)
-				out = append(out, model.Message{Role: "assistant", ToolCalls: []any{map[string]any{"id": tc.ID, "type": "function", "function": map[string]any{"name": tool.ModelName(tc.Name), "arguments": string(args)}}}})
-				continue
+		var runErr error
+		switch job.Kind {
+		case "memory.extract":
+			var payload struct {
+				TaskID string `json:"task_id"`
 			}
-			role = "user"
-			m.Content = "此前模型请求：" + m.Content
+			if e = json.Unmarshal([]byte(job.Payload), &payload); e != nil {
+				runErr = e
+				break
+			}
+			task, x := s.store.Task(ctx, payload.TaskID)
+			if x != nil {
+				runErr = x
+				break
+			}
+			msgs, x := s.store.TaskMessages(ctx, payload.TaskID, 500)
+			if x != nil {
+				runErr = x
+				break
+			}
+			workspace, _ := s.store.TaskWorkspaceRoot(ctx, payload.TaskID)
+			runErr = s.memories.Extract(ctx, task, msgs, workspace)
+			if runErr != nil {
+				s.store.Emit(ctx, task.SessionID, task.ID, "memory.extraction_failed", map[string]any{"error": runErr.Error()})
+			} else {
+				s.store.Emit(ctx, task.SessionID, task.ID, "memory.candidate.extracted", map[string]any{"status": "completed"})
+			}
+		case "memory.maintain":
+			runErr = s.memories.Maintain(ctx)
+		default:
+			runErr = fmt.Errorf("unknown maintenance job %s", job.Kind)
 		}
-		out = append(out, model.Message{Role: role, Content: m.Content})
+		_ = s.store.FinishMaintenance(ctx, job.ID, runErr)
 	}
-	return out, nil
 }

@@ -24,6 +24,9 @@ func TestMemoryUpdateDeleteAndSecret(t *testing.T) {
 	if err := m.Upsert(context.Background(), Entry{Type: "user", Content: "password=secret", Summary: "x"}); err == nil {
 		t.Fatal("secret accepted")
 	}
+	if err := m.Upsert(context.Background(), Entry{Type: "user", Content: "Qm9va0Zha2VUb2tlbkFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaMTIzNDU2Nzg5", Summary: "opaque value"}); err == nil {
+		t.Fatal("high-entropy secret candidate accepted")
+	}
 	if err := m.Delete(context.Background(), "m1"); err != nil {
 		t.Fatal(err)
 	}

@@ -146,5 +146,10 @@ func (c *Client) Consult(ctx context.Context, problem, expected string) (string,
 	return r.Content, e
 }
 
+func (c *Client) Complete(ctx context.Context, system, user string) (string, error) {
+	r, e := c.Generate(ctx, []Message{{Role: "system", Content: system}, {Role: "user", Content: user}}, nil)
+	return r.Content, e
+}
+
 var _ = bufio.NewReader
 var _ = time.Second

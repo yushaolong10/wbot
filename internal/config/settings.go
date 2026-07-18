@@ -22,6 +22,35 @@ type Profile struct {
 	CustomInstructions string                                `yaml:"custom_instructions"`
 }
 
+type MemoryRetrieval struct {
+	MaxEntries, MaxTokens, MaxEntryTokens int
+	MinScore                              float64
+	UseFTS, UseEmbeddings, UseLLMRerank   bool
+}
+type MemoryWrite struct {
+	MinConfidence                    float64
+	RequireEvidence, AutoConsolidate bool
+}
+type MemoryRetention struct {
+	EpisodicTTLDays, DeletedRetentionDays, VersionRetentionCount, StaleAfterDays int
+	EnablePhysicalGC                                                             bool
+}
+type MemorySettings struct {
+	Enabled, AutoExtract bool
+	Retrieval            MemoryRetrieval
+	Write                MemoryWrite
+	Retention            MemoryRetention
+}
+type HistorySettings struct {
+	MaxLoadedMessages, RecentMessages, RecentMinMessages               int
+	SegmentMessages, SegmentMaxSourceTokens, SegmentMergeFactor        int
+	SummaryTargetTokens, ToolSnapshotMaxTokens, ReactiveRecentMessages int
+	ReactiveRetryCount                                                 int
+}
+type ContextSettings struct {
+	SafetyMarginTokens, OutputReserveTokens int
+}
+
 type Model struct {
 	BaseURL, Name, APIKey     string
 	Thinking, ReasoningEffort string
@@ -36,6 +65,9 @@ type Settings struct {
 	MaxContextTokens                                                                    int
 	AdvisorMaxCalls                                                                     int
 	DefaultModel, AdvisorModel                                                          Model
+	Memory                                                                              MemorySettings
+	History                                                                             HistorySettings
+	Context                                                                             ContextSettings
 }
 
 func Load() (Settings, error) {
@@ -53,6 +85,12 @@ func Load() (Settings, error) {
 		AdvisorMaxCalls:  envInt("WBOT_ADVISOR_MAX_CALLS_PER_TASK", 3),
 		DefaultModel:     Model{BaseURL: env("WBOT_MODEL_BASE_URL", "https://api.deepseek.com"), Name: env("WBOT_DEFAULT_MODEL", "deepseek-v4-flash"), APIKey: modelAPIKey, MaxOutputTokens: envInt("WBOT_DEFAULT_MAX_OUTPUT_TOKENS", 16000), Timeout: time.Duration(envInt("WBOT_MODEL_TIMEOUT_SECONDS", 120)) * time.Second},
 		AdvisorModel:     Model{BaseURL: env("WBOT_ADVISOR_BASE_URL", env("WBOT_MODEL_BASE_URL", "https://api.deepseek.com")), Name: env("WBOT_ADVISOR_MODEL", "deepseek-v4-pro"), APIKey: modelAPIKey, Thinking: "enabled", ReasoningEffort: "max", MaxOutputTokens: envInt("WBOT_ADVISOR_MAX_OUTPUT_TOKENS", 32000), Timeout: time.Duration(envInt("WBOT_ADVISOR_TIMEOUT_SECONDS", 180)) * time.Second},
+		Memory: MemorySettings{Enabled: envBool("WBOT_MEMORY_ENABLED", true), AutoExtract: envBool("WBOT_MEMORY_AUTO_EXTRACT", true),
+			Retrieval: MemoryRetrieval{MaxEntries: envInt("WBOT_MEMORY_MAX_ENTRIES", 8), MaxTokens: envInt("WBOT_MEMORY_MAX_TOKENS", 6000), MaxEntryTokens: envInt("WBOT_MEMORY_MAX_ENTRY_TOKENS", 800), MinScore: .35, UseFTS: true, UseLLMRerank: envBool("WBOT_MEMORY_LLM_RERANK", true)},
+			Write:     MemoryWrite{MinConfidence: .8, RequireEvidence: true, AutoConsolidate: true},
+			Retention: MemoryRetention{EpisodicTTLDays: 90, DeletedRetentionDays: 30, VersionRetentionCount: 10, StaleAfterDays: 180, EnablePhysicalGC: true}},
+		History: HistorySettings{MaxLoadedMessages: envInt("WBOT_HISTORY_MAX_LOADED", 500), RecentMessages: envInt("WBOT_HISTORY_RECENT_MESSAGES", 20), RecentMinMessages: 4, SegmentMessages: envInt("WBOT_HISTORY_SEGMENT_MESSAGES", 30), SegmentMaxSourceTokens: envInt("WBOT_HISTORY_SEGMENT_MAX_TOKENS", 12000), SegmentMergeFactor: 4, SummaryTargetTokens: envInt("WBOT_HISTORY_SUMMARY_TOKENS", 800), ToolSnapshotMaxTokens: envInt("WBOT_TOOL_SNAPSHOT_MAX_TOKENS", 1200), ReactiveRecentMessages: 6, ReactiveRetryCount: envInt("WBOT_HISTORY_REACTIVE_RETRY_COUNT", 1)},
+		Context: ContextSettings{SafetyMarginTokens: envInt("WBOT_CONTEXT_SAFETY_MARGIN", 2000), OutputReserveTokens: envInt("WBOT_DEFAULT_MAX_OUTPUT_TOKENS", 16000)},
 	}
 	if s.PermissionMode != "approval" && s.PermissionMode != "full_access" {
 		return s, fmt.Errorf("invalid WBOT_PERMISSION_MODE %q", s.PermissionMode)
@@ -60,14 +98,43 @@ func Load() (Settings, error) {
 	if s.MaxParallelism < 1 {
 		return s, errors.New("WBOT_TASK_MAX_PARALLELISM must be positive")
 	}
-	for _, k := range []string{"WBOT_ALLOW_SHELL", "WBOT_ALLOW_NETWORK", "WBOT_ALLOW_EXTERNAL_WRITE"} {
+	positive := map[string]int{
+		"WBOT_MAX_CONTEXT_TOKENS":           s.MaxContextTokens,
+		"WBOT_DEFAULT_MAX_OUTPUT_TOKENS":    s.DefaultModel.MaxOutputTokens,
+		"WBOT_CONTEXT_SAFETY_MARGIN":        s.Context.SafetyMarginTokens,
+		"WBOT_MEMORY_MAX_ENTRIES":           s.Memory.Retrieval.MaxEntries,
+		"WBOT_MEMORY_MAX_TOKENS":            s.Memory.Retrieval.MaxTokens,
+		"WBOT_MEMORY_MAX_ENTRY_TOKENS":      s.Memory.Retrieval.MaxEntryTokens,
+		"WBOT_HISTORY_MAX_LOADED":           s.History.MaxLoadedMessages,
+		"WBOT_HISTORY_RECENT_MESSAGES":      s.History.RecentMessages,
+		"WBOT_HISTORY_SEGMENT_MESSAGES":     s.History.SegmentMessages,
+		"WBOT_HISTORY_SEGMENT_MAX_TOKENS":   s.History.SegmentMaxSourceTokens,
+		"WBOT_HISTORY_SUMMARY_TOKENS":       s.History.SummaryTargetTokens,
+		"WBOT_TOOL_SNAPSHOT_MAX_TOKENS":     s.History.ToolSnapshotMaxTokens,
+		"WBOT_HISTORY_REACTIVE_RETRY_COUNT": s.History.ReactiveRetryCount,
+	}
+	for name, value := range positive {
+		if value <= 0 {
+			return s, fmt.Errorf("%s must be positive", name)
+		}
+	}
+	if s.Context.OutputReserveTokens+s.Context.SafetyMarginTokens >= s.MaxContextTokens {
+		return s, errors.New("output reserve plus safety margin must be smaller than model context window")
+	}
+	if s.History.ReactiveRetryCount != 1 {
+		return s, errors.New("WBOT_HISTORY_REACTIVE_RETRY_COUNT must be 1")
+	}
+	if !s.Memory.Enabled {
+		s.Memory.AutoExtract = false
+	}
+	for _, k := range []string{"WBOT_ALLOW_SHELL", "WBOT_ALLOW_NETWORK", "WBOT_ALLOW_EXTERNAL_WRITE", "WBOT_MEMORY_ENABLED", "WBOT_MEMORY_AUTO_EXTRACT", "WBOT_MEMORY_LLM_RERANK"} {
 		if v := os.Getenv(k); v != "" {
 			if _, e := strconv.ParseBool(v); e != nil {
 				return s, fmt.Errorf("%s must be a boolean: %w", k, e)
 			}
 		}
 	}
-	for _, k := range []string{"WBOT_TASK_MAX_PARALLELISM", "WBOT_MAX_CONTEXT_TOKENS", "WBOT_ADVISOR_MAX_CALLS_PER_TASK"} {
+	for _, k := range []string{"WBOT_TASK_MAX_PARALLELISM", "WBOT_MAX_CONTEXT_TOKENS", "WBOT_DEFAULT_MAX_OUTPUT_TOKENS", "WBOT_ADVISOR_MAX_CALLS_PER_TASK", "WBOT_MEMORY_MAX_ENTRIES", "WBOT_MEMORY_MAX_TOKENS", "WBOT_MEMORY_MAX_ENTRY_TOKENS", "WBOT_HISTORY_MAX_LOADED", "WBOT_HISTORY_RECENT_MESSAGES", "WBOT_HISTORY_SEGMENT_MESSAGES", "WBOT_HISTORY_SEGMENT_MAX_TOKENS", "WBOT_HISTORY_SUMMARY_TOKENS", "WBOT_TOOL_SNAPSHOT_MAX_TOKENS", "WBOT_HISTORY_REACTIVE_RETRY_COUNT", "WBOT_CONTEXT_SAFETY_MARGIN"} {
 		if v := os.Getenv(k); v != "" {
 			if _, e := strconv.Atoi(v); e != nil {
 				return s, fmt.Errorf("%s must be an integer: %w", k, e)

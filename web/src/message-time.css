@@ -1,0 +1,76 @@
+article label {
+  margin-bottom: 0;
+}
+
+/* Keep the composer inside the native window; only the message pane scrolls. */
+.app > main {
+  position: relative;
+  grid-template-rows: 74px minmax(0, 1fr) auto;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.app > main > .error {
+  position: absolute;
+  top: 74px;
+  right: 0;
+  left: 0;
+  z-index: 2;
+}
+
+.app > main > .messages {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.app > main > .composer {
+  position: relative;
+  z-index: 1;
+  flex: none;
+  background: #fafbf9;
+}
+
+.message-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 5px;
+}
+
+.message-meta time {
+  color: #89938c;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.task-elapsed {
+  margin-top: 9px;
+  color: #758178;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.task-elapsed.active {
+  color: #208554;
+}
+
+.task-elapsed.active::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  vertical-align: 1px;
+  animation: processing-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes processing-pulse {
+  50% {
+    opacity: .28;
+  }
+}

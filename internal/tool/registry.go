@@ -43,13 +43,17 @@ func New(s config.Settings, st *storage.Store, p *permission.Engine, m *memory.M
 	return &Registry{s: s, store: st, permissions: p, memories: m, advisor: a, advisorCalls: map[string]int{}}
 }
 func (r *Registry) Definitions() []Definition {
-	return []Definition{
+	defs := []Definition{
 		{"filesystem.read", "读取授权工作区内的文本文件", obj(map[string]any{"path": str("文件路径")}, "path")},
 		{"filesystem.write", "创建或覆盖授权工作区内的文件", obj(map[string]any{"path": str("文件路径"), "content": str("文件内容")}, "path", "content")},
 		{"shell.execute", "在授权工作区内运行命令", obj(map[string]any{"command": str("命令"), "timeout_seconds": map[string]any{"type": "integer"}}, "command")},
-		{"memory.save", "保存经过验证、未来可复用的长期记忆", obj(map[string]any{"type": str("user/project/episodic/procedural"), "summary": str("摘要"), "content": str("内容"), "tags": map[string]any{"type": "array", "items": map[string]any{"type": "string"}}}, "type", "summary", "content")},
 		{"consult_advisor", "咨询高能力模型，返回建议但不执行操作", obj(map[string]any{"problem": str("问题"), "expected_output": str("期望输出"), "relevant_context": str("必要上下文")}, "problem", "expected_output")},
 	}
+	if r.s.Memory.Enabled {
+		memoryDef := Definition{"memory.save", "保存经过验证、未来可复用的长期记忆", obj(map[string]any{"type": str("user/project/episodic/procedural"), "summary": str("摘要"), "content": str("内容"), "tags": map[string]any{"type": "array", "items": map[string]any{"type": "string"}}}, "type", "summary", "content")}
+		defs = append(defs[:3], append([]Definition{memoryDef}, defs[3:]...)...)
+	}
+	return defs
 }
 
 // ModelName converts an internal, human-readable tool name into the portable
@@ -165,7 +169,8 @@ func (r *Registry) Execute(ctx context.Context, taskID string, c domain.ToolCall
 				tags = append(tags, asString(v))
 			}
 		}
-		err = r.memories.Upsert(ctx, memory.Entry{Type: asString(c.Arguments["type"]), Summary: asString(c.Arguments["summary"]), Content: asString(c.Arguments["content"]), Tags: tags, Confidence: .8, Importance: .7})
+		workspace, _ := r.store.TaskWorkspaceRoot(ctx, taskID)
+		err = r.memories.Upsert(ctx, memory.Entry{WorkspaceID: workspace, Type: asString(c.Arguments["type"]), Summary: asString(c.Arguments["summary"]), Content: asString(c.Arguments["content"]), Tags: tags, Confidence: .8, Importance: .7, Source: memory.Source{TaskID: taskID, ToolCallIDs: []string{c.ID}, Extraction: "explicit"}})
 		res.Summary = "记忆已保存"
 	case "consult_advisor":
 		if r.advisor == nil {
